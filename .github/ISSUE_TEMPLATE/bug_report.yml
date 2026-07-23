@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible defect using redacted, synthetic data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never include OAuth credentials, tokens, account identifiers, reminder
+        or task content, raw logs, exports, or local absolute paths.
+        Security issues must use the private vulnerability reporting flow.
+  - type: input
+    id: version
+    attributes:
+      label: Commit or release
+      description: Provide the full commit SHA or release identifier.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Use synthetic examples and redact all private data.
+    validations:
+      required: true
+  - type: dropdown
+    id: mutation
+    attributes:
+      label: Did the reproduction write to Apple Reminders or Google Tasks?
+      options:
+        - "No"
+        - "Yes, using non-sensitive test data"
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials, tokens, account identifiers, user content, exports, logs, and local paths.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

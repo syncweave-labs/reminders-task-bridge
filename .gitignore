@@ -1,0 +1,46 @@
+# Local secrets and runtime state
+.env
+.env.*
+!.env.example
+!.env.*.example
+credentials.json
+client_secret*.json
+*.apps.googleusercontent.com.json
+application_default_credentials.json
+config.json
+token.json
+state.json
+status.json
+.config/
+sessions/
+cookies*
+com.icloud-reminders-google-sync.plist
+
+# Generated caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+
+# Local exports and temporary files
+*.log
+*.jsonl
+*.tmp
+*.temp
+.DS_Store
+*.db
+*.sqlite
+*.sqlite3
+data/
+media/
+exports/
+dist/
+server-dist/
+build/
+release/
+*.zip
+icloud-reminders-google-sync-migration-*.tar.gz
+reminders-export*.json
+tasks-export*.json
+exported-reminders*.json
+exported-tasks*.json
