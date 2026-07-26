@@ -981,7 +981,19 @@ def refresh_token_with_fallback(config: dict[str, Any], token: dict[str, Any]) -
 
         fallback = load_fallback_token(config, token)
         if fallback:
-            require_expected_google_credential_binding(config, fallback)
+            # load_fallback_token only ever returns a candidate whose refresh
+            # token differs from the one that just failed, while the binding is
+            # derived from that same failed token. A fallback that belongs to a
+            # different credential is therefore the normal case, not an
+            # emergency: it is unusable, so drop it and ask for reauthorization.
+            # Raising here instead left the loop with no way forward, because
+            # the actionable AuthenticationRequired below was never reached.
+            try:
+                require_expected_google_credential_binding(config, fallback)
+            except AccountBindingRequired:
+                fallback = None
+
+        if fallback:
             try:
                 return refresh_token(config, fallback)
             except OAuthTokenError as fallback_exc:

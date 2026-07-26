@@ -118,10 +118,16 @@ class AccountBindingIsolationTests(unittest.TestCase):
         with mock.patch.object(sync, "refresh_token", side_effect=invalid_grant) as refresh, mock.patch.object(
             sync, "load_fallback_token", return_value=token_b
         ):
-            with self.assertRaises(sync.AccountBindingRequired):
+            # The fallback must never be used, but it must also not become a
+            # dead end: the caller needs the actionable reauthorization request.
+            with self.assertRaises(sync.AuthenticationRequired) as caught:
                 sync.refresh_token_with_fallback(config, token_a)
 
+        self.assertIn("gcloud-login", str(caught.exception))
+        # Still exactly one call, with token_a: the mismatched credential was
+        # never sent to Google.
         self.assertEqual(refresh.call_count, 1)
+        self.assertEqual(refresh.call_args.args[1], token_a)
 
     def test_client_rechecks_google_binding_before_using_a_replaced_token(self) -> None:
         token_a = {
