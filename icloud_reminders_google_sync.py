@@ -4821,8 +4821,52 @@ def notify_sync_problem(config: dict[str, Any], message: str) -> None:
     )
 
 
+def local_reauth_can_satisfy_binding(config: dict[str, Any]) -> bool:
+    """Whether a browser OAuth login could produce the credential the state expects.
+
+    run_auth_flow only ever mints a local_oauth credential. When the sync state
+    is bound to the gcloud ADC credential instead, that new token is a different
+    identity and the binding guard has to reject it, so the flow opens a browser
+    the owner did not ask for and leaves the loop exactly where it was.
+    """
+    try:
+        state = load_state(expand_path(config["state_path"]))
+    except Exception:
+        return True
+    bound = str((state.get("account_binding") or {}).get("google") or "")
+    if not bound:
+        return True
+    for candidate in load_token_candidates(config):
+        if str(candidate.get("_credential_source") or "") != "gcloud_adc":
+            continue
+        try:
+            if google_credential_binding(candidate) == bound:
+                return False
+        except AuthenticationRequired:
+            continue
+    return True
+
+
 def maybe_run_auto_reauth(config: dict[str, Any], reason: str) -> bool:
     if not config.get("auto_reauth_browser"):
+        return False
+
+    if not local_reauth_can_satisfy_binding(config):
+        message = (
+            "Sync state is bound to the gcloud ADC credential, so a browser OAuth login "
+            "would mint a different identity that the account binding must reject. "
+            "Restore the bound credential instead:\n"
+            "  gcloud auth application-default login"
+        )
+        eprint(message)
+        write_sync_status(
+            config,
+            {
+                "state": "auth_required",
+                "last_auto_reauth_skipped_at": utc_now_text(),
+                "last_error": message,
+            },
+        )
         return False
 
     status = read_sync_status(config)
