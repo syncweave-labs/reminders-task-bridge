@@ -104,6 +104,77 @@ class AccountBindingIsolationTests(unittest.TestCase):
 
             self.assertEqual(state_path.read_bytes(), before)
 
+    def test_auto_reauth_is_skipped_when_state_is_bound_to_adc(self) -> None:
+        # run_auth_flow only mints a local_oauth credential, so for ADC-bound
+        # state it opens a browser and produces a token the binding guard must
+        # reject. Running it can never converge, so it must not run.
+        adc = {"refresh_token": "ADC_ONLY_REFRESH", "_credential_source": "gcloud_adc"}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "account_binding": {
+                            "version": 1,
+                            "apple": "apple-binding",
+                            "google": sync.google_credential_binding(adc),
+                        },
+                        "events": {},
+                        "tasks": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = sync.default_config()
+            config["state_path"] = str(state_path)
+            config["auto_reauth_browser"] = True
+
+            with mock.patch.object(sync, "load_token_candidates", return_value=[adc]):
+                self.assertFalse(sync.local_reauth_can_satisfy_binding(config))
+                with mock.patch.object(
+                    sync,
+                    "run_auth_flow",
+                    side_effect=AssertionError("a browser login must not be opened"),
+                ), mock.patch.object(sync, "write_sync_status") as write_status:
+                    self.assertFalse(sync.maybe_run_auto_reauth(config, "expired"))
+
+            recorded = write_status.call_args.args[1]
+            self.assertEqual(recorded["state"], "auth_required")
+            self.assertIn("gcloud auth application-default login", recorded["last_error"])
+
+    def test_auto_reauth_still_runs_when_state_is_bound_to_the_local_credential(self) -> None:
+        local = {"refresh_token": "LOCAL_ONLY_REFRESH", "_credential_source": "local_oauth"}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "account_binding": {
+                            "version": 1,
+                            "apple": "apple-binding",
+                            "google": sync.google_credential_binding(local),
+                        },
+                        "events": {},
+                        "tasks": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = sync.default_config()
+            config["state_path"] = str(state_path)
+
+            with mock.patch.object(sync, "load_token_candidates", return_value=[local]):
+                self.assertTrue(sync.local_reauth_can_satisfy_binding(config))
+
+    def test_auto_reauth_runs_when_nothing_is_bound_yet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            config = sync.default_config()
+            config["state_path"] = str(state_path)
+            self.assertTrue(sync.local_reauth_can_satisfy_binding(config))
+
     def test_refresh_fallback_cannot_cross_the_bound_google_credential(self) -> None:
         token_a = {"refresh_token": "TENANT_A_ONLY_GOOGLE_REFRESH"}
         token_b = {"refresh_token": "TENANT_B_ONLY_GOOGLE_REFRESH"}
@@ -773,6 +844,10 @@ class GoogleTasksDueTests(unittest.TestCase):
                     "auto_reauth_browser": True,
                     "macos_notifications": False,
                     "status_path": str(Path(tmp_name) / "status.json"),
+                    # Keep the test hermetic: without these it reads the real
+                    # state file and ADC credentials from the developer's home.
+                    "state_path": str(Path(tmp_name) / "state.json"),
+                    "adc_credentials_path": str(Path(tmp_name) / "adc.json"),
                 }
             )
 
@@ -852,6 +927,10 @@ class GoogleTasksDueTests(unittest.TestCase):
                     "auto_reauth_browser": True,
                     "macos_notifications": False,
                     "status_path": str(Path(tmp_name) / "status.json"),
+                    # Keep the test hermetic: without these it reads the real
+                    # state file and ADC credentials from the developer's home.
+                    "state_path": str(Path(tmp_name) / "state.json"),
+                    "adc_credentials_path": str(Path(tmp_name) / "adc.json"),
                 }
             )
             sync.write_sync_status(
