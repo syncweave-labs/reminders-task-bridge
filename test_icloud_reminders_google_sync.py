@@ -1293,6 +1293,123 @@ class ListPolicyTests(unittest.TestCase):
         self.assertEqual(plan["conflicts"], [])
         self.assertEqual([action["operation"] for action in plan["actions"]], ["update"])
 
+    def test_newer_google_title_preserves_concurrent_apple_due_date(self) -> None:
+        config = sync.default_config()
+        config.update({"bidirectional": True, "conflict_policy": "newer_wins"})
+        reminder = self.reminder("dated-concurrently", "Personal")
+        reminder["modified_at"] = "2026-07-17T04:50:00Z"
+        uid, body, digest = sync.build_task(reminder, config)
+        google_task = {
+            **body,
+            "id": "google-newer-title",
+            "title": "Changed in Google",
+            "updated": "2026-07-17T04:54:18Z",
+        }
+        google_task.pop("due")
+        tasklist_id = "personal-list"
+        state = {
+            "version": 1,
+            "events": {},
+            "tasks": {
+                sync.target_state_key(tasklist_id, uid): {
+                    "tasklist_id": tasklist_id,
+                    "tasklist_title": "Personal",
+                    "task_id": google_task["id"],
+                    "digest": "older-apple-digest",
+                    "google_digest": "older-google-digest",
+                    "source_stable_id": reminder["stable_id"],
+                }
+            },
+        }
+
+        inbound = sync.plan_google_task_changes_to_reminders(
+            config,
+            {"Personal": {uid: (body, digest, reminder)}},
+            {"Personal": tasklist_id},
+            {"Personal": {uid: google_task}},
+            {"Personal": [google_task]},
+            {"Personal": []},
+            state,
+            allow_deletes=True,
+        )
+        outbound = sync.plan_google_task_outbound_mutations(
+            config,
+            {"Personal": {uid: (body, digest, reminder)}},
+            {"Personal": tasklist_id},
+            {"Personal": {uid: google_task}},
+            {"Personal": {}},
+            {"Personal": {}},
+            {"Personal": {google_task["id"]: google_task}},
+            {"Personal": []},
+            state,
+            set(inbound["source_controlled"]),
+            {},
+            allow_deletes=True,
+        )
+
+        self.assertEqual([operation["title"] for operation in inbound["operations"]], ["Changed in Google"])
+        self.assertNotIn("clear_due", inbound["operations"][0])
+        self.assertNotIn(("Personal", uid), inbound["source_controlled"])
+        self.assertEqual([action["operation"] for action in outbound], ["update"])
+
+    def test_missing_google_due_with_stale_source_digest_repairs_google_not_apple(self) -> None:
+        config = sync.default_config()
+        config.update({"bidirectional": True, "conflict_policy": "newer_wins"})
+        reminder = self.reminder("dated-with-stale-digest", "Personal")
+        reminder["modified_at"] = "2026-07-17T04:50:00Z"
+        uid, body, digest = sync.build_task(reminder, config)
+        google_task = {
+            **body,
+            "id": "google-missing-due",
+            "notes": str(body["notes"]).replace(digest, "older-source-digest"),
+            "updated": "2026-07-17T04:54:18Z",
+        }
+        google_task.pop("due")
+        tasklist_id = "personal-list"
+        state = {
+            "version": 1,
+            "events": {},
+            "tasks": {
+                sync.target_state_key(tasklist_id, uid): {
+                    "tasklist_id": tasklist_id,
+                    "tasklist_title": "Personal",
+                    "task_id": google_task["id"],
+                    "digest": "older-apple-digest",
+                    "google_digest": "older-google-digest",
+                    "source_stable_id": reminder["stable_id"],
+                }
+            },
+        }
+
+        inbound = sync.plan_google_task_changes_to_reminders(
+            config,
+            {"Personal": {uid: (body, digest, reminder)}},
+            {"Personal": tasklist_id},
+            {"Personal": {uid: google_task}},
+            {"Personal": [google_task]},
+            {"Personal": []},
+            state,
+            allow_deletes=True,
+        )
+        outbound = sync.plan_google_task_outbound_mutations(
+            config,
+            {"Personal": {uid: (body, digest, reminder)}},
+            {"Personal": tasklist_id},
+            {"Personal": {uid: google_task}},
+            {"Personal": {}},
+            {"Personal": {}},
+            {"Personal": {google_task["id"]: google_task}},
+            {"Personal": []},
+            state,
+            set(inbound["source_controlled"]),
+            {},
+            allow_deletes=True,
+        )
+
+        self.assertEqual(inbound["operations"], [])
+        self.assertEqual(inbound["source_controlled"], set())
+        self.assertEqual([action["operation"] for action in outbound], ["update"])
+
     def test_reopened_apple_reminder_reopens_older_completed_google_task_without_state(self) -> None:
         config = sync.default_config()
         config.update({"bidirectional": True, "conflict_policy": "newer_wins"})
