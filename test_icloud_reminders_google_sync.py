@@ -1548,6 +1548,51 @@ class ListPolicyTests(unittest.TestCase):
         self.assertEqual([action["operation"] for action in inbound_plan["actions"]], ["delete"])
         self.assertEqual([action["operation"] for action in outbound_plan], ["delete"])
 
+    def test_deleted_tombstone_is_ignored_when_same_uid_is_active(self) -> None:
+        config = sync.default_config()
+        config["bidirectional"] = True
+        reminder = self.reminder("recreated", "Personal")
+        uid, body, digest = sync.build_task(reminder, config)
+        tasklist_id = "personal-list"
+        active_task = {**body, "id": "active-recreated-task"}
+        deleted_task = {
+            "id": "old-deleted-task",
+            "title": body["title"],
+            "deleted": True,
+            "notes": (
+                "Synced from Apple Reminders.\n"
+                f"Source UID: {uid}\n"
+                "Source Digest: old"
+            ),
+        }
+        state = {"version": 1, "events": {}, "tasks": {}}
+        sync.save_task_state(
+            state,
+            tasklist_id,
+            uid,
+            active_task,
+            digest,
+            str(body["title"]),
+            reminder,
+            config,
+            "Personal",
+        )
+
+        plan = sync.plan_google_task_changes_to_reminders(
+            config,
+            {"Personal": {uid: (body, digest, reminder)}},
+            {"Personal": tasklist_id},
+            {"Personal": {uid: active_task}},
+            {"Personal": [active_task]},
+            {"Personal": [deleted_task]},
+            state,
+            allow_deletes=True,
+        )
+
+        self.assertEqual(plan["operations"], [])
+        self.assertEqual(plan["actions"], [])
+        self.assertEqual(plan["blocked"], set())
+
     def test_conflict_policy_is_resolved_per_list(self) -> None:
         config = sync.default_config()
         config["list_policies"] = sync.normalize_list_policies(

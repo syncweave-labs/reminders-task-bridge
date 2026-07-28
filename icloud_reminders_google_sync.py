@@ -2455,6 +2455,7 @@ def plan_google_task_changes_to_reminders(
             if not tasklist_id:
                 continue
             desired = desired_by_list.get(list_title, {})
+            active_by_uid = existing_by_list.get(list_title, {})
 
             for task in tasks:
                 if not task.get("deleted"):
@@ -2464,6 +2465,8 @@ def plan_google_task_changes_to_reminders(
                     continue
                 uid = metadata.get("source uid")
                 if not uid or (list_title, uid) in seen_deleted_uids:
+                    continue
+                if uid in active_by_uid:
                     continue
 
                 record = task_state_record(state, tasklist_id, uid)
