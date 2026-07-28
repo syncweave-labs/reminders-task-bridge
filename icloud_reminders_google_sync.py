@@ -2539,14 +2539,24 @@ def plan_google_task_changes_to_reminders(
             if not google_changed:
                 continue
 
-            # Preserve Apple due dates when a previously generated Google task only lost its API due field.
-            if task_has_current_source_digest(existing, digest) and task_only_due_differs(existing, body, reminder, config):
-                continue
-
             apple_changed = bool(record and record.get("digest") and record.get("digest") != digest)
             title = str(existing.get("title") or body.get("title") or uid)
             policy = list_sync_policy(config, list_title)
             google_is_authoritative = policy["direction"] == "google_to_apple"
+            preserve_concurrent_apple_due = bool(
+                apple_changed
+                and not google_is_authoritative
+                and body.get("due")
+                and not existing.get("due")
+            )
+
+            # Google Tasks can temporarily omit a generated due field. Also,
+            # when both sides changed, a newer Google title or note must not
+            # erase a date that was concurrently added in Apple Reminders.
+            if task_only_due_differs(existing, body, reminder, config) and (
+                task_has_current_source_digest(existing, digest) or preserve_concurrent_apple_due
+            ):
+                continue
 
             # A completed Google task can outlive its local state record while the
             # matching Apple reminder is completed. If the reminder is reopened
@@ -2572,6 +2582,8 @@ def plan_google_task_changes_to_reminders(
                 if google_is_authoritative or policy["conflict_policy"] == "newer_wins":
                     if google_is_authoritative or google_task_is_newer_than_reminder(existing, reminder):
                         operation = google_task_to_reminder_operation(existing, reminder, config)
+                        if preserve_concurrent_apple_due:
+                            operation.pop("clear_due", None)
                         if operation.get("complete") and not list_allows_delete_propagation(
                             config,
                             list_title,
@@ -2582,7 +2594,8 @@ def plan_google_task_changes_to_reminders(
                             continue
                         operations.append(operation)
                         operation_contexts.append(("update", None))
-                        source_controlled.add((list_title, uid))
+                        if not preserve_concurrent_apple_due or operation.get("complete"):
+                            source_controlled.add((list_title, uid))
                         operation_name = "complete" if operation.get("complete") else "update"
                         actions.append(
                             planned_mutation(
