@@ -161,13 +161,19 @@ notes에 추가될 수 있지만 제목·날짜·완료 상태의 흐름은 `dir
   current -> releases/<full-commit-sha>               # LaunchAgent의 고정 경로
 ~/.config/icloud-reminders-google-sync/               # config, credentials, state, status
 ~/Library/LaunchAgents/com.icloud-reminders-google-sync.plist
-/tmp/icloud-reminders-google-sync.out.log
-/tmp/icloud-reminders-google-sync.err.log
+~/Library/Logs/icloud-reminders-google-sync/
+  sync.out.log                                        # LaunchAgent 표준 출력
+  sync.err.log                                        # LaunchAgent 표준 오류
 ```
 
-설치기는 두 로그를 사용자 전용 `0600`으로 만들고 기본 5 MiB 이상이면
-기존 내용을 `.1`로 한 번 회전한 뒤 LaunchAgent를 다시 시작합니다.
+로그에는 미리 알림과 목록 제목이 남으므로 누구나 읽고 쓸 수 있는 `/tmp`에
+두지 않습니다. 설치기는 로그 디렉터리를 사용자 전용 `0700`으로 만들고 두
+로그를 `0600`으로 맞춥니다. 로그 경로가 심볼릭 링크이면 설치를 중단하고, 예전
+설치가 `/tmp`에 남긴 로그는 삭제합니다. 기본 5 MiB 이상이면 기존 내용을 `.1`로
+한 번 회전한 뒤 LaunchAgent를 다시 시작합니다.
 `ICLOUD_SYNC_LOG_MAX_BYTES`로 재설치 시 회전 기준을 조정할 수 있습니다.
+launchd가 지워진 로그를 자기 기본 권한으로 다시 만들기 때문에, `run-loop`는
+시작할 때 자기 로그 파일 권한을 다시 `0600`으로 되돌립니다.
 
 LaunchAgent는 소스 체크아웃이나 Codex worktree를 직접 실행하지 않는다.
 항상 `~/.local/share/icloud-reminders-google-sync/current`를 실행하므로 작업

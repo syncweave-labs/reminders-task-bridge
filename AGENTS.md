@@ -24,8 +24,10 @@ user's Mac and are never proved by source CI alone.
 - Config, credentials, state, and status:
   `~/.config/icloud-reminders-google-sync/`.
 - LaunchAgent: `~/Library/LaunchAgents/com.icloud-reminders-google-sync.plist`.
-- Logs: `/tmp/icloud-reminders-google-sync.out.log` and
-  `/tmp/icloud-reminders-google-sync.err.log`.
+- Logs: `~/Library/Logs/icloud-reminders-google-sync/sync.out.log` and
+  `~/Library/Logs/icloud-reminders-google-sync/sync.err.log`, in a `0700`
+  directory. Reminder and task titles appear in them, so they never go back to
+  `/tmp`.
 
 The LaunchAgent must execute the stable runtime pointer. It must not refer to a
 task branch, Codex worktree, Downloads folder, migration extraction folder, or
