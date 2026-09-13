@@ -163,19 +163,37 @@ TOKEN_PATH="${CONFIG_DIR}/token.json"
 STATUS_PATH="${CONFIG_DIR}/status.json"
 PLIST_PATH="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 MANAGER_LAUNCHER="${HOME}/Applications/Google Tasks 동기화 관리.command"
-STDOUT_LOG="/tmp/icloud-reminders-google-sync.out.log"
-STDERR_LOG="/tmp/icloud-reminders-google-sync.err.log"
+LOG_DIR="${HOME}/Library/Logs/icloud-reminders-google-sync"
+STDOUT_LOG="${LOG_DIR}/sync.out.log"
+STDERR_LOG="${LOG_DIR}/sync.err.log"
+LEGACY_STDOUT_LOG="/tmp/icloud-reminders-google-sync.out.log"
+LEGACY_STDERR_LOG="/tmp/icloud-reminders-google-sync.err.log"
 LOG_MAX_BYTES="${ICLOUD_SYNC_LOG_MAX_BYTES:-5242880}"
 
 prepare_runtime_logs() {
   local log_path
   local log_size
+  local legacy_path
 
   case "$LOG_MAX_BYTES" in
     ''|*[!0-9]*) die "ICLOUD_SYNC_LOG_MAX_BYTES must be a non-negative integer." ;;
   esac
 
+  # Reminder and task titles end up in these logs, so they must never live in a
+  # world-writable, world-readable directory. launchd reopens the log paths by
+  # name on every restart and recreates a missing file with its own default
+  # mode, so the per-file chmod below cannot be the only protection: the
+  # containing directory carries it instead.
+  if [ -L "$LOG_DIR" ]; then
+    die "Refusing to use a symlinked log directory: ${LOG_DIR}"
+  fi
+  mkdir -p "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
+
   for log_path in "$STDOUT_LOG" "$STDERR_LOG"; do
+    if [ -L "$log_path" ]; then
+      die "Refusing to write the LaunchAgent log through a symlink: ${log_path}"
+    fi
     if [ -f "$log_path" ] && [ "$LOG_MAX_BYTES" -gt 0 ]; then
       log_size="$(wc -c <"$log_path" | tr -d ' ')"
       if [ "$log_size" -ge "$LOG_MAX_BYTES" ]; then
@@ -188,6 +206,15 @@ prepare_runtime_logs() {
       (umask 077 && : >"$log_path")
     fi
     chmod 600 "$log_path"
+  done
+
+  # Earlier installs pointed the LaunchAgent at /tmp, where launchd left the
+  # files world-readable. Retire that history instead of leaving it behind.
+  for legacy_path in "$LEGACY_STDOUT_LOG" "$LEGACY_STDERR_LOG"; do
+    if [ -f "$legacy_path" ] && [ ! -L "$legacy_path" ]; then
+      info "Removing legacy world-readable log: ${legacy_path}"
+      rm -f "$legacy_path" "${legacy_path}.1"
+    fi
   done
 }
 
@@ -454,14 +481,34 @@ run_google_setup() {
 }
 
 check_reminders_access() {
+  local lists_out
+  local lists_err
+  local export_status
+
   info "Checking Apple Reminders access"
-  if swift "$EXPORTER" --lists-only >/tmp/icloud-reminders-google-sync-lists.json 2>/tmp/icloud-reminders-google-sync-lists.err; then
+  # The exporter output is TCC-protected Reminders content (list titles and the
+  # account path). Fixed /tmp names would publish it to every local UID and let
+  # a pre-planted symlink steer the redirect, so use unpredictable private
+  # files and delete them on both paths.
+  lists_out="$(umask 077 && mktemp "${TMPDIR:-/tmp}/icloud-reminders-google-sync-lists.XXXXXXXX")" \
+    || die "Could not create a private temporary file for the Reminders list check."
+  lists_err="$(umask 077 && mktemp "${TMPDIR:-/tmp}/icloud-reminders-google-sync-lists-err.XXXXXXXX")" \
+    || die "Could not create a private temporary file for the Reminders list check."
+
+  set +e
+  swift "$EXPORTER" --lists-only >"$lists_out" 2>"$lists_err"
+  export_status=$?
+  set -e
+
+  if [ "$export_status" -eq 0 ]; then
     printf 'Reminders lists detected:\n'
-    sed -n '1,40p' /tmp/icloud-reminders-google-sync-lists.json
+    sed -n '1,40p' "$lists_out"
+    rm -f "$lists_out" "$lists_err"
   else
     warn "Could not read Reminders lists."
     warn "Open System Settings > Privacy & Security > Reminders and allow Terminal or your shell app, then run this script again."
-    sed -n '1,80p' /tmp/icloud-reminders-google-sync-lists.err >&2 || true
+    sed -n '1,80p' "$lists_err" >&2 || true
+    rm -f "$lists_out" "$lists_err"
     exit 1
   fi
 }

@@ -3,7 +3,10 @@ import contextlib
 import datetime as dt
 import io
 import json
+import os
 from pathlib import Path
+import stat
+import subprocess
 import tempfile
 from unittest import mock
 
@@ -237,6 +240,15 @@ class GoogleTasksDueTests(unittest.TestCase):
         self.assertIn('mv "$log_path" "${log_path}.1"', setup_source)
         self.assertIn('"list_policies": {}', setup_source)
         self.assertLess(setup_source.index("prepare_runtime_logs\nwrite_launch_agent"), setup_source.rindex("load_launch_agent"))
+        # The LaunchAgent logs carry reminder and task titles, so they must not
+        # be written into the world-writable, world-readable /tmp.
+        self.assertIn('LOG_DIR="${HOME}/Library/Logs/icloud-reminders-google-sync"', setup_source)
+        self.assertIn('STDOUT_LOG="${LOG_DIR}/sync.out.log"', setup_source)
+        self.assertIn('STDERR_LOG="${LOG_DIR}/sync.err.log"', setup_source)
+        self.assertNotIn('\nSTDOUT_LOG="/tmp/', setup_source)
+        self.assertNotIn('\nSTDERR_LOG="/tmp/', setup_source)
+        self.assertNotIn("/tmp/icloud-reminders-google-sync-lists", setup_source)
+        self.assertIn('chmod 700 "$LOG_DIR"', setup_source)
 
     def test_setup_does_not_embed_a_maintainer_google_cloud_project(self) -> None:
         setup_source = (Path(__file__).resolve().parent / "setup-new-mac.sh").read_text(encoding="utf-8")
@@ -2197,6 +2209,211 @@ class MutationPlanTests(unittest.TestCase):
         self.assertEqual(bidirectional["actions"], [])
         self.assertIn(("Personal", active_uid), bidirectional["blocked"])
         self.assertEqual(outbound, [])
+
+
+SETUP_PATH = Path(__file__).resolve().parent / "setup-new-mac.sh"
+
+
+def setup_shell_function(name: str) -> str:
+    """Return one function definition from setup-new-mac.sh.
+
+    The installer runs its whole install flow at import time, so the tests
+    execute the individual functions instead of sourcing the file.
+    """
+
+    source = SETUP_PATH.read_text(encoding="utf-8")
+    start = source.index(f"\n{name}() {{\n") + 1
+    end = source.index("\n}\n", start) + len("\n}\n")
+    return source[start:end]
+
+
+def setup_shell_assignments(*names: str) -> str:
+    source = SETUP_PATH.read_text(encoding="utf-8")
+    wanted = [f"{name}=" for name in names]
+    return "\n".join(
+        line for line in source.splitlines() if any(line.startswith(prefix) for prefix in wanted)
+    )
+
+
+class LaunchAgentLogPrivacyTests(unittest.TestCase):
+    """The sync logs hold Apple Reminders titles; keep them out of shared /tmp."""
+
+    def run_shell(self, body: str, env: dict[str, str], cwd: str) -> subprocess.CompletedProcess[str]:
+        script = Path(cwd) / "harness.sh"
+        script.write_text(body, encoding="utf-8")
+        full_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        full_env.update(env)
+        return subprocess.run(
+            ["bash", str(script)],
+            env=full_env,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+
+    def prepare_logs_harness(self, legacy_out: Path, legacy_err: Path, extra: str = "") -> str:
+        return "\n".join(
+            [
+                "set -euo pipefail",
+                'info() { printf "INFO: %s\\n" "$*"; }',
+                'warn() { printf "WARN: %s\\n" "$*" >&2; }',
+                'die() { printf "ERROR: %s\\n" "$*" >&2; exit 3; }',
+                setup_shell_assignments(
+                    "LOG_DIR", "STDOUT_LOG", "STDERR_LOG", "LEGACY_STDOUT_LOG", "LEGACY_STDERR_LOG", "LOG_MAX_BYTES"
+                ),
+                # Never let the test delete the real user's /tmp history.
+                f'LEGACY_STDOUT_LOG="{legacy_out}"',
+                f'LEGACY_STDERR_LOG="{legacy_err}"',
+                setup_shell_function("prepare_runtime_logs"),
+                extra,
+                "prepare_runtime_logs",
+            ]
+        )
+
+    def test_prepare_runtime_logs_writes_only_into_a_private_user_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            base = Path(tmp_name)
+            home = base / "home"
+            home.mkdir()
+            legacy_out = base / "legacy.out.log"
+            legacy_err = base / "legacy.err.log"
+            legacy_out.write_text("CANARY_REMINDER_TITLE\n", encoding="utf-8")
+            legacy_err.write_text("Sync loop error: CANARY_REMINDER_TITLE\n", encoding="utf-8")
+            legacy_out.chmod(0o644)
+
+            result = self.run_shell(
+                self.prepare_logs_harness(legacy_out, legacy_err), {"HOME": str(home)}, tmp_name
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            log_dir = home / "Library" / "Logs" / "icloud-reminders-google-sync"
+            self.assertTrue(log_dir.is_dir())
+            self.assertEqual(stat.S_IMODE(log_dir.stat().st_mode), 0o700)
+            for name in ("sync.out.log", "sync.err.log"):
+                log_path = log_dir / name
+                self.assertTrue(log_path.is_file(), name)
+                self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600, name)
+            # The world-readable history from the old /tmp layout is retired.
+            self.assertFalse(legacy_out.exists())
+            self.assertFalse(legacy_err.exists())
+
+    def test_prepare_runtime_logs_refuses_a_planted_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            base = Path(tmp_name)
+            home = base / "home"
+            log_dir = home / "Library" / "Logs" / "icloud-reminders-google-sync"
+            log_dir.mkdir(parents=True)
+            victim = base / "victim.txt"
+            victim.write_text("owned by someone else\n", encoding="utf-8")
+            victim.chmod(0o644)
+            (log_dir / "sync.out.log").symlink_to(victim)
+
+            result = self.run_shell(
+                self.prepare_logs_harness(base / "legacy.out.log", base / "legacy.err.log"),
+                {"HOME": str(home)},
+                tmp_name,
+            )
+
+            self.assertEqual(result.returncode, 3, result.stdout)
+            self.assertIn("symlink", result.stderr)
+            # The chmod never followed the link.
+            self.assertEqual(stat.S_IMODE(victim.stat().st_mode), 0o644)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "owned by someone else\n")
+
+    def test_prepare_runtime_logs_still_rotates_oversized_logs_privately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            base = Path(tmp_name)
+            home = base / "home"
+            log_dir = home / "Library" / "Logs" / "icloud-reminders-google-sync"
+            log_dir.mkdir(parents=True)
+            current = log_dir / "sync.out.log"
+            current.write_text("x" * 64, encoding="utf-8")
+            current.chmod(0o644)
+
+            result = self.run_shell(
+                self.prepare_logs_harness(base / "legacy.out.log", base / "legacy.err.log"),
+                {"HOME": str(home), "ICLOUD_SYNC_LOG_MAX_BYTES": "32"},
+                tmp_name,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rotated = log_dir / "sync.out.log.1"
+            self.assertTrue(rotated.is_file())
+            self.assertEqual(stat.S_IMODE(rotated.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(current.stat().st_mode), 0o600)
+            self.assertEqual(current.read_text(encoding="utf-8"), "")
+
+    def reminders_access_harness(self, swift_status: int) -> str:
+        return "\n".join(
+            [
+                "set -euo pipefail",
+                'info() { printf "INFO: %s\\n" "$*"; }',
+                'warn() { printf "WARN: %s\\n" "$*" >&2; }',
+                'die() { printf "ERROR: %s\\n" "$*" >&2; exit 3; }',
+                'EXPORTER="/nonexistent/RemindersExport.swift"',
+                "swift() {",
+                '  printf \'[{"title":"CANARY_LIST_TITLE"}]\\n\'',
+                '  printf "exporter CANARY_ERROR\\n" >&2',
+                f"  return {swift_status}",
+                "}",
+                setup_shell_function("check_reminders_access"),
+                "check_reminders_access",
+            ]
+        )
+
+    def test_reminders_list_export_never_lands_on_a_fixed_tmp_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            scratch = Path(tmp_name) / "tmpdir"
+            scratch.mkdir()
+
+            result = self.run_shell(
+                self.reminders_access_harness(0), {"TMPDIR": str(scratch)}, tmp_name
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("CANARY_LIST_TITLE", result.stdout)
+            self.assertFalse(Path("/tmp/icloud-reminders-google-sync-lists.json").exists())
+            self.assertFalse(Path("/tmp/icloud-reminders-google-sync-lists.err").exists())
+            # Nothing survives the run, so nothing stays readable to other UIDs.
+            self.assertEqual(sorted(p.name for p in scratch.iterdir()), [])
+
+    def test_reminders_list_export_cleans_up_on_the_failure_path_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            scratch = Path(tmp_name) / "tmpdir"
+            scratch.mkdir()
+
+            result = self.run_shell(
+                self.reminders_access_harness(1), {"TMPDIR": str(scratch)}, tmp_name
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("CANARY_ERROR", result.stderr)
+            self.assertEqual(sorted(p.name for p in scratch.iterdir()), [])
+
+    def test_run_loop_startup_reprivatises_a_relaxed_log_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            log_path = Path(tmp_name) / "sync.out.log"
+            log_path.write_text("", encoding="utf-8")
+            log_path.chmod(0o644)
+
+            with log_path.open("a", encoding="utf-8") as handle:
+                sync.harden_log_stream_mode(handle)
+
+            self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+
+    def test_log_hardening_leaves_non_files_alone(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(write_fd, "w") as handle:
+                write_fd = -1
+                sync.harden_log_stream_mode(handle)
+        finally:
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
+
+        # A closed or already private stream must not raise either.
+        sync.harden_log_stream_mode(io.StringIO())
 
 
 if __name__ == "__main__":

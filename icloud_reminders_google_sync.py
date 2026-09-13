@@ -14,6 +14,7 @@ from pathlib import Path
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -182,6 +183,41 @@ def google_api_failure_summary(status: int) -> str:
 
 def eprint(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def harden_log_stream_mode(stream: Any) -> None:
+    """Make a redirected log file private to this user.
+
+    The LaunchAgent writes reminder and task titles to its stdout/stderr files.
+    launchd recreates a missing StandardOutPath/StandardErrorPath itself, so an
+    install-time chmod does not survive; re-apply 0600 to our own descriptor at
+    startup. Working on the open descriptor rather than a path means a symlink
+    or a replaced file cannot redirect the permission change.
+    """
+
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        return
+    if not stat.S_ISREG(info.st_mode):
+        return
+    if info.st_uid != os.getuid():
+        return
+    if not stat.S_IMODE(info.st_mode) & 0o077:
+        return
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+
+
+def harden_runtime_log_modes() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        harden_log_stream_mode(stream)
 
 
 def expand_path(value: str | os.PathLike[str]) -> Path:
@@ -5058,6 +5094,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
 
 def cmd_run_loop(args: argparse.Namespace) -> None:
+    harden_runtime_log_modes()
     config = load_config(args)
     interval = int(config["sync_interval_seconds"])
     if interval < 60:
