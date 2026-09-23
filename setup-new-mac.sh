@@ -371,6 +371,7 @@ write_config() {
   "max_destructive_changes": 25,
   "max_destructive_ratio": 0.25,
   "destructive_approval_ttl_seconds": 600,
+  "auto_approve_destructive_loops": 0,
   "notify_failure_min_interval_seconds": 300,
   "notify_success_min_interval_seconds": 3600,
   "prefix_list": false,

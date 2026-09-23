@@ -1605,6 +1605,98 @@ class ListPolicyTests(unittest.TestCase):
         self.assertEqual(plan["actions"], [])
         self.assertEqual(plan["blocked"], set())
 
+    def test_old_tombstone_cannot_delete_restored_reminder_without_matching_state(self) -> None:
+        config = sync.default_config()
+        config.update({"bidirectional": True, "conflict_policy": "newer_wins"})
+        reminder = self.reminder("restored", "Personal")
+        uid, body, digest = sync.build_task(reminder, config)
+        deleted_task = {
+            **body,
+            "id": "old-deleted-task",
+            "deleted": True,
+            "updated": "2026-07-12T00:00:00Z",
+        }
+        # Restoration may retain its original timestamp. The old deletion must
+        # not win merely because it is newer than that timestamp.
+        for recorded_task_id in (None, "replacement-task", ""):
+            with self.subTest(recorded_task_id=recorded_task_id):
+                state = {"version": 1, "events": {}, "tasks": {}}
+                if recorded_task_id is not None:
+                    sync.save_task_state(
+                        state, "personal-list", uid, {**body, "id": recorded_task_id},
+                        digest, str(body["title"]), reminder, config, "Personal",
+                    )
+                plan = sync.plan_google_task_changes_to_reminders(
+                    config,
+                    {"Personal": {uid: (body, digest, reminder)}},
+                    {"Personal": "personal-list"},
+                    {"Personal": {}},
+                    {"Personal": []},
+                    {"Personal": [deleted_task]},
+                    state,
+                    allow_deletes=True,
+                )
+                self.assertEqual(plan["operations"], [])
+                self.assertEqual(plan["actions"], [])
+                self.assertEqual(plan["blocked"], set())
+                self.assertEqual(plan["source_controlled"], set())
+
+    def test_google_deletion_applies_once_then_restoration_recreates_google_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = sync.default_config()
+            config.update({
+                "state_path": str(Path(tmp_name) / "state.json"),
+                "status_path": str(Path(tmp_name) / "status.json"),
+                "bidirectional": True,
+                "conflict_policy": "newer_wins",
+                "tasks_complete_stale": False,
+                "verify_title_due_after_sync": False,
+            })
+            reminder = self.reminder("restored-after-delete", "Personal")
+            uid, body, digest = sync.build_task(reminder, config)
+            deleted_task = {
+                **body,
+                "id": "deleted-task",
+                "deleted": True,
+                "updated": "2026-07-12T00:00:00Z",
+            }
+            state = {"version": 1, "events": {}, "tasks": {}}
+            sync.save_task_state(
+                state, "personal-list", uid, deleted_task, digest,
+                str(body["title"]), reminder, config, "Personal",
+            )
+            desired = {"Personal": {uid: (body, digest, reminder)}}
+            with mock.patch.object(sync, "run_reminders_apply", return_value=[{"status": "deleted"}]) as apply:
+                applied, _, _, _ = sync.apply_google_task_changes_to_reminders(
+                    config, mock.Mock(), desired, {"Personal": "personal-list"},
+                    {"Personal": {}}, {"Personal": []}, {"Personal": [deleted_task]},
+                    state, False,
+                )
+            self.assertEqual(applied, 1)
+            self.assertTrue(apply.call_args.args[1][0]["delete"])
+            self.assertIsNone(sync.task_state_record(state, "personal-list", uid))
+            sync.write_json_atomic(Path(config["state_path"]), state)
+
+            # The user restores the same Apple item. Google keeps returning its
+            # old tombstone both before and after a replacement task is created.
+            client = mock.Mock()
+            client.list_tasklists.return_value = [{"id": "personal-list", "title": "Personal"}]
+            client.list_tasks.return_value = [deleted_task]
+            replacement = {**body, "id": "replacement-task"}
+            client.insert_task.return_value = replacement
+            with mock.patch.object(sync, "GoogleTasksClient", return_value=client), mock.patch.object(
+                sync, "build_desired_tasks", return_value=([reminder], desired, 0),
+            ), mock.patch.object(sync, "run_reminders_apply") as apply:
+                sync.run_tasks_sync(config)
+                client.list_tasks.return_value = [deleted_task, replacement]
+                sync.run_tasks_sync(config)
+            apply.assert_not_called()
+            client.insert_task.assert_called_once_with("personal-list", body)
+            client.delete_task.assert_not_called()
+            client.patch_task.assert_not_called()
+            saved = sync.load_state(Path(config["state_path"]))
+            self.assertEqual(sync.task_state_record(saved, "personal-list", uid)["task_id"], "replacement-task")
+
     def test_conflict_policy_is_resolved_per_list(self) -> None:
         config = sync.default_config()
         config["list_policies"] = sync.normalize_list_policies(
@@ -1780,6 +1872,36 @@ class ListPolicyTests(unittest.TestCase):
 
 
 class BlockedPlanAutoApprovalTests(unittest.TestCase):
+    def test_default_loop_keeps_repeated_destructive_plan_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = sync.default_config()
+            config.update({
+                "state_path": str(Path(tmp_name) / "state.json"),
+                "status_path": str(Path(tmp_name) / "status.json"),
+            })
+            plan = sync.build_mutation_plan([
+                sync.planned_mutation("apple_reminders", "delete", "restored", destructive=True),
+            ], 1)
+            writes = []
+
+            def attempt(config: dict[str, object], dry_run: bool = False) -> None:
+                sync.enforce_mutation_plan(config, plan, dry_run=dry_run)
+                writes.append("deleted")
+
+            with mock.patch.object(sync, "load_config", return_value=config), mock.patch.object(
+                sync, "run_sync", side_effect=attempt,
+            ) as run, mock.patch.object(sync, "harden_runtime_log_modes"), mock.patch.object(
+                sync, "notify_sync_problem",
+            ) as notify, mock.patch.object(sync, "notify_sync_ok"), mock.patch.object(
+                sync.time, "sleep", side_effect=[None, None, None, None, KeyboardInterrupt],
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                sync.cmd_run_loop(mock.Mock())
+
+            self.assertEqual(writes, [])
+            self.assertEqual(run.call_count, 5)
+            self.assertEqual(sync.read_sync_status(config)["state"], "blocked_mutation_plan")
+            self.assertTrue(all("requires explicit approval" in call.args[1] for call in notify.call_args_list))
+
     def test_streak_counts_only_identical_consecutive_fingerprints(self) -> None:
         fp, streak = sync.next_blocked_plan_streak("", 0, "aaa")
         self.assertEqual((fp, streak), ("aaa", 1))

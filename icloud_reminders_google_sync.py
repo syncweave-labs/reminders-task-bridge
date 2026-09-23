@@ -103,7 +103,7 @@ def default_config() -> dict[str, Any]:
         "max_destructive_changes": 25,
         "max_destructive_ratio": 0.25,
         "destructive_approval_ttl_seconds": 600,
-        "auto_approve_destructive_loops": 3,
+        "auto_approve_destructive_loops": 0,
         "reminders_exporter_path": str(PROJECT_DIR / "RemindersExport.swift"),
         "reminders_apply_path": str(PROJECT_DIR / "RemindersApply.swift"),
         "reminders_source": "auto",
@@ -2506,6 +2506,12 @@ def plan_google_task_changes_to_reminders(
                     continue
 
                 record = task_state_record(state, tasklist_id, uid)
+                # A tombstone is an edge from the currently tracked task, not
+                # a permanent ban on this source UID. Successful deletion in
+                # either direction removes that mapping. Replaying its old
+                # tombstone would delete an Apple reminder the user restored.
+                if not record or not task.get("id") or record.get("task_id") != task.get("id"):
+                    continue
                 desired_item = desired.get(uid)
                 reminder = desired_item[2] if desired_item else {}
                 if record and desired_item and record.get("digest") and record.get("digest") != desired_item[1]:
@@ -5199,7 +5205,9 @@ def cmd_run_loop(args: argparse.Namespace) -> None:
             else:
                 notify_sync_problem(
                     config,
-                    "Sync paused by a large destructive change plan; it will be applied automatically if it stays identical.",
+                    "Sync paused by a large destructive change plan; it will be applied automatically if it stays identical."
+                    if int(config.get("auto_approve_destructive_loops", 0) or 0) > 0
+                    else "Sync paused because a destructive mutation plan requires explicit approval.",
                 )
         except AccountBindingRequired as exc:
             consecutive_failures += 1

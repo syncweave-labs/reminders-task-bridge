@@ -141,6 +141,12 @@ config는 변경 없이 같은 방식으로 동작한다.
 config 오류로 중단한다. `--no-delete-stale`은 목록별
 `delete_propagation: true`보다 우선하는 전체 안전 차단이다.
 
+Google의 삭제 기록은 현재 동기화 상태에 연결된 동일한 task ID에만
+적용한다. 삭제가 반영되어 연결이 정리된 뒤 Apple에서 같은 미리 알림을
+복원하면, 과거 삭제 기록으로 다시 지우지 않는다. 양방향 목록에서는
+복원한 항목을 Google에 다시 생성한다. 상태 맵이 없는 경우에도 과거
+삭제 기록만으로 Apple 항목을 지우지 않는다.
+
 빈 Apple 목록 미러링은 계속 유지된다. 다만 `google_to_apple` 전용 목록과
 같은 이름의 Google Tasks 목록이 없으면, 방향 정책을 어기며 새 Google
 목록을 만들지 않고 해당 주기를 건너뛴다. Google에만 있는 일반 task를
@@ -366,6 +372,9 @@ fingerprint를 출력한다. 기본값은 파괴적 완료/삭제/중복 정리�
 초과하거나 현재 관리 항목의 25%를 초과하면 쓰기 전에 중단하는 것이다.
 `max_destructive_changes`, `max_destructive_ratio`,
 `destructive_approval_ttl_seconds`로 기준을 조정할 수 있다.
+`auto_approve_destructive_loops`의 기본값과 설치값은 `0`이다. 같은 대량
+삭제 계획이 계속 반복돼도 자동으로 승인하지 않고 명시적인 승인을 기다린다.
+기존 config에 양수가 지정되어 있다면 `0`으로 바꾸면 자동 승인을 끌 수 있다.
 
 의도한 대량 변경은 먼저 dry-run에서 fingerprint와 짧게 유효한 승인 token을
 확인한 뒤, 같은 plan에만 적용되는 token을 명시적으로 전달한다.
