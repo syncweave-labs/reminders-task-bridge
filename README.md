@@ -372,6 +372,9 @@ fingerprint를 출력한다. 기본값은 파괴적 완료/삭제/중복 정리�
 초과하거나 현재 관리 항목의 25%를 초과하면 쓰기 전에 중단하는 것이다.
 `max_destructive_changes`, `max_destructive_ratio`,
 `destructive_approval_ttl_seconds`로 기준을 조정할 수 있다.
+`auto_approve_destructive_loops`의 기본값과 설치값은 `0`이다. 같은 대량
+삭제 계획이 계속 반복돼도 자동으로 승인하지 않고 명시적인 승인을 기다린다.
+기존 config에 양수가 지정되어 있다면 `0`으로 바꾸면 자동 승인을 끌 수 있다.
 
 의도한 대량 변경은 먼저 dry-run에서 fingerprint와 짧게 유효한 승인 token을
 확인한 뒤, 같은 plan에만 적용되는 token을 명시적으로 전달한다.

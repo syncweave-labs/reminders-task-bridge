@@ -1872,6 +1872,36 @@ class ListPolicyTests(unittest.TestCase):
 
 
 class BlockedPlanAutoApprovalTests(unittest.TestCase):
+    def test_default_loop_keeps_repeated_destructive_plan_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = sync.default_config()
+            config.update({
+                "state_path": str(Path(tmp_name) / "state.json"),
+                "status_path": str(Path(tmp_name) / "status.json"),
+            })
+            plan = sync.build_mutation_plan([
+                sync.planned_mutation("apple_reminders", "delete", "restored", destructive=True),
+            ], 1)
+            writes = []
+
+            def attempt(config: dict[str, object], dry_run: bool = False) -> None:
+                sync.enforce_mutation_plan(config, plan, dry_run=dry_run)
+                writes.append("deleted")
+
+            with mock.patch.object(sync, "load_config", return_value=config), mock.patch.object(
+                sync, "run_sync", side_effect=attempt,
+            ) as run, mock.patch.object(sync, "harden_runtime_log_modes"), mock.patch.object(
+                sync, "notify_sync_problem",
+            ) as notify, mock.patch.object(sync, "notify_sync_ok"), mock.patch.object(
+                sync.time, "sleep", side_effect=[None, None, None, None, KeyboardInterrupt],
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                sync.cmd_run_loop(mock.Mock())
+
+            self.assertEqual(writes, [])
+            self.assertEqual(run.call_count, 5)
+            self.assertEqual(sync.read_sync_status(config)["state"], "blocked_mutation_plan")
+            self.assertTrue(all("requires explicit approval" in call.args[1] for call in notify.call_args_list))
+
     def test_streak_counts_only_identical_consecutive_fingerprints(self) -> None:
         fp, streak = sync.next_blocked_plan_streak("", 0, "aaa")
         self.assertEqual((fp, streak), ("aaa", 1))
