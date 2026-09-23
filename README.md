@@ -141,6 +141,12 @@ config는 변경 없이 같은 방식으로 동작한다.
 config 오류로 중단한다. `--no-delete-stale`은 목록별
 `delete_propagation: true`보다 우선하는 전체 안전 차단이다.
 
+Google의 삭제 기록은 현재 동기화 상태에 연결된 동일한 task ID에만
+적용한다. 삭제가 반영되어 연결이 정리된 뒤 Apple에서 같은 미리 알림을
+복원하면, 과거 삭제 기록으로 다시 지우지 않는다. 양방향 목록에서는
+복원한 항목을 Google에 다시 생성한다. 상태 맵이 없는 경우에도 과거
+삭제 기록만으로 Apple 항목을 지우지 않는다.
+
 빈 Apple 목록 미러링은 계속 유지된다. 다만 `google_to_apple` 전용 목록과
 같은 이름의 Google Tasks 목록이 없으면, 방향 정책을 어기며 새 Google
 목록을 만들지 않고 해당 주기를 건너뛴다. Google에만 있는 일반 task를

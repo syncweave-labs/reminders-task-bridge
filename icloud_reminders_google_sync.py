@@ -2506,6 +2506,12 @@ def plan_google_task_changes_to_reminders(
                     continue
 
                 record = task_state_record(state, tasklist_id, uid)
+                # A tombstone is an edge from the currently tracked task, not
+                # a permanent ban on this source UID. Successful deletion in
+                # either direction removes that mapping. Replaying its old
+                # tombstone would delete an Apple reminder the user restored.
+                if not record or not task.get("id") or record.get("task_id") != task.get("id"):
+                    continue
                 desired_item = desired.get(uid)
                 reminder = desired_item[2] if desired_item else {}
                 if record and desired_item and record.get("digest") and record.get("digest") != desired_item[1]:
