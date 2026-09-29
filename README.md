@@ -82,6 +82,8 @@ Security reports should follow [SECURITY.md](SECURITY.md), not a public issue.
 - Google 목록 조회가 늦을 때는 최근 task 단건 조회와 짧은 재시도를
   사용한다.
 - 동시 실행은 잠금 파일로 막고, 마지막 결과는 `status.json`에 쓴다.
+- 한도를 넘는 삭제·완료는 로그인한 사용자에게 한 번 묻고 승인한 묶음만
+  적용한다. 답을 기다리는 동안에도 나머지 변경은 계속 동기화한다.
 - 사용자 세션의 LaunchAgent가 1분 간격으로 실행한다. Mac이 잠자거나
   사용자가 로그아웃한 동안 실행되는 서버 데몬은 아니다.
 - 새 Mac의 첫 동기화는 반드시 `--no-delete-stale`로 상태 맵을 재구축한다.
@@ -295,8 +297,13 @@ Editor에서 진단 문구만 확인하거나 긴 Terminal 명령을 복사할 �
    `~/.config/icloud-reminders-google-sync/backups/`에 `0600`으로 백업하고
    LaunchAgent를 잠시 멈춘다. 인증이 실제로 만료된 경우에만 브라우저
    로그인을 시작한다.
-4. 백그라운드 다시 시작: 인증 만료, 계정 binding 차이, 대량 변경 차단이
-   없을 때만 LaunchAgent를 다시 올린다.
+4. 백그라운드 다시 시작: 인증 만료나 계정 binding 차이가 없을 때만
+   LaunchAgent를 다시 올린다.
+5. 대량 변경 검토 후 적용: LaunchAgent를 잠시 멈추고 아무것도 쓰지 않은 채
+   다음 동기화 계획을 계산해, 한도를 넘는 삭제·완료 항목을 목록별 제목으로
+   모두 보여 준다. `y`를 입력하면 private 파일을 백업한 뒤 방금 확인한
+   삭제·완료 묶음만 적용하고, 그 외 답은 보류로 기록한다. 끝나면
+   LaunchAgent를 원래대로 다시 올린다.
 
 관리 메뉴는 상태를 다음처럼 구분한다.
 
@@ -305,7 +312,8 @@ Editor에서 진단 문구만 확인하거나 긴 Terminal 명령을 복사할 �
 | `healthy` | 최근 동기화가 성공했고 LaunchAgent가 실행 중 | 조치 없음 |
 | `auth_required` | Google token이 없거나 만료·취소됨 | 브라우저 로그인 후 Tasks API 재검증 |
 | `account_binding_required` | Google 인증은 가능하지만 Apple/Google 계정 기준이 저장 상태와 다름 | 계정 확인 후 기존 상태를 백업으로 이동하고 안전 재구축 |
-| `mutation_blocked` | 완료·삭제 계획이 안전 한도를 넘음 | 자동 승인하지 않고 별도 dry-run 검토 |
+| `mutation_approval_pending` | 완료·삭제 계획이 안전 한도를 넘어 답을 기다림. 나머지 변경은 계속 동기화 | 화면의 확인 창에 답하거나 5번에서 검토 후 적용·보류 |
+| `mutation_blocked` | 수동 `sync`가 한도를 넘는 완료·삭제 계획에서 멈춤 | 5번에서 검토 후 적용·보류 |
 | `agent_stopped` | 백그라운드 작업이 로드되지 않음 | 원인을 해결한 뒤 메뉴에서 재시작 |
 
 `account_binding_required` 복구는 Google/Apple 데이터를 지우지 않는다. 먼저
@@ -373,11 +381,35 @@ fingerprint를 출력한다. 기본값은 파괴적 완료/삭제/중복 정리�
 `max_destructive_changes`, `max_destructive_ratio`,
 `destructive_approval_ttl_seconds`로 기준을 조정할 수 있다.
 `auto_approve_destructive_loops`의 기본값과 설치값은 `0`이다. 같은 대량
-삭제 계획이 계속 반복돼도 자동으로 승인하지 않고 명시적인 승인을 기다린다.
+삭제 계획이 계속 반복돼도 자동으로 승인하지 않는다.
 기존 config에 양수가 지정되어 있다면 `0`으로 바꾸면 자동 승인을 끌 수 있다.
 
-의도한 대량 변경은 먼저 dry-run에서 fingerprint와 짧게 유효한 승인 token을
-확인한 뒤, 같은 plan에만 적용되는 token을 명시적으로 전달한다.
+### 대량 변경 확인
+
+백그라운드 동기화는 한도를 넘는 계획을 만나도 전체 동기화를 멈추지 않는다.
+
+1. 그 주기부터 삭제·완료만 보류하고 생성·수정 등 나머지 변경은
+   `--no-delete-stale`과 같은 방식으로 계속 동기화한다. 상태는
+   `awaiting_mutation_approval`이다.
+2. 같은 삭제·완료 묶음이 두 주기 연속 나오면(일시적인 부분 export로 질문하지
+   않도록) 로그인한 사용자 화면에 확인 창을 한 번 띄운다. 창에는 종류별
+   건수, 목록별 건수, 예시 제목이 나오고 기본 버튼은 `보류`다.
+3. `적용`을 누르면 다음 주기에 방금 본 삭제·완료 묶음만 적용한다. 그 사이
+   다른 항목이 더 지워지는 등 묶음이 바뀌면 적용하지 않고 새 계획으로 다시
+   묻는다. 새 미리 알림처럼 삭제와 무관한 변경은 승인을 무효로 만들지 않는다.
+4. `보류`를 누르면 `mutation_approval_prompt_repeat_seconds`(기본 6시간)
+   동안 다시 묻지 않고, 그동안에도 나머지는 계속 동기화한다. 답하지 않은
+   창은 열린 채로 기다리며, 계획이 사라지면(항목 복구 등) 창을 닫는다.
+
+확인 창을 띄울 수 없거나 `mutation_approval_prompt`가 `false`이면 같은
+간격으로 알림 하나만 보낸다. 이때와 수동 `sync`가 막힌 경우에는 관리
+메뉴의 `대량 변경 검토 후 적용`에서 Terminal로 전체 목록을 확인하고 적용하거나
+보류할 수 있다. 창의 제목 목록은 argv가 아닌 자식 프로세스 환경 변수로
+전달되며, `status.json`에는 답, 삭제·완료 묶음의 hash, 시각만 남는다.
+
+Terminal에서 token으로 직접 승인하는 기존 방법도 그대로 쓸 수 있다.
+먼저 dry-run에서 fingerprint와 짧게 유효한 승인 token을 확인한 뒤, 같은
+plan에만 적용되는 token을 명시적으로 전달한다.
 
 ```bash
 /opt/homebrew/bin/python3 "$RUNTIME/icloud_reminders_google_sync.py" sync --dry-run

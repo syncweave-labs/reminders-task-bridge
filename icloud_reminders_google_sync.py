@@ -8,6 +8,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import http.server
+import io
 import json
 import os
 from pathlib import Path
@@ -69,6 +70,7 @@ KNOWN_STATUS_STATES = {
     "auth_refreshed",
     "auth_required",
     "auth_timeout",
+    "awaiting_mutation_approval",
     "blocked_mutation_plan",
     "dry_run_ok",
     "failed",
@@ -104,6 +106,8 @@ def default_config() -> dict[str, Any]:
         "max_destructive_ratio": 0.25,
         "destructive_approval_ttl_seconds": 600,
         "auto_approve_destructive_loops": 0,
+        "mutation_approval_prompt": True,
+        "mutation_approval_prompt_repeat_seconds": 21600,
         "reminders_exporter_path": str(PROJECT_DIR / "RemindersExport.swift"),
         "reminders_apply_path": str(PROJECT_DIR / "RemindersApply.swift"),
         "reminders_source": "auto",
@@ -267,9 +271,27 @@ def sha256_text(value: str, length: int | None = None) -> str:
 
 
 class MutationPlanApprovalRequired(SystemExit):
-    def __init__(self, message: str, summary: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        message: str,
+        summary: dict[str, Any],
+        review: dict[str, Any] | None = None,
+    ) -> None:
         self.summary = summary
+        # Titles and list names for the signed-in user's own approval prompt.
+        # They are never written to status.json or the logs; `summary` is the
+        # sanitized half that is.
+        self.review = review or {}
         super().__init__(message)
+
+
+class MutationPlanPreview(Exception):
+    """Raised in place of any write when a caller asked only for the plan."""
+
+    def __init__(self, plan: dict[str, Any], reasons: list[str]) -> None:
+        self.plan = plan
+        self.reasons = reasons
+        super().__init__("mutation plan preview")
 
 
 def planned_mutation(
@@ -278,13 +300,21 @@ def planned_mutation(
     identity: Any,
     *,
     destructive: bool = False,
+    list_title: str = "",
+    title: str = "",
 ) -> dict[str, Any]:
-    return {
+    action: dict[str, Any] = {
         "target": target,
         "operation": operation,
         "resource": sha256_text(canonical_json(identity), 24),
         "destructive": bool(destructive),
     }
+    if destructive:
+        # A local-only label so a person can review what a large plan would
+        # delete or complete. It is excluded from every fingerprint and from
+        # the sanitized summary.
+        action["review"] = {"list": str(list_title or ""), "title": str(title or "")}
+    return action
 
 
 def build_mutation_plan(actions: list[dict[str, Any]], population: int) -> dict[str, Any]:
@@ -321,6 +351,25 @@ def build_mutation_plan(actions: list[dict[str, Any]], population: int) -> dict[
         "population": safe_population,
         "actions": normalized,
     }
+    # The exact set of deletions and completions, independent of unrelated
+    # creates and updates. A person approves this set, so an approval stays
+    # valid when a new reminder appears but not when one more item would go.
+    destructive_material = {
+        "version": 1,
+        "actions": [action for action in normalized if action["destructive"]],
+    }
+    review_items = sorted(
+        (
+            {
+                "operation": f"{action['target']}.{action['operation']}",
+                "list": str((action.get("review") or {}).get("list") or ""),
+                "title": str((action.get("review") or {}).get("title") or ""),
+            }
+            for action in actions
+            if action.get("destructive")
+        ),
+        key=lambda item: (item["operation"], item["list"], item["title"]),
+    )
     return {
         "version": 1,
         "actions": normalized,
@@ -331,6 +380,19 @@ def build_mutation_plan(actions: list[dict[str, Any]], population: int) -> dict[
         "population": safe_population,
         "destructive_ratio": destructive_ratio,
         "fingerprint": sha256_text(canonical_json(fingerprint_material)),
+        "destructive_fingerprint": sha256_text(canonical_json(destructive_material)),
+        "review_items": review_items,
+    }
+
+
+def mutation_plan_review(plan: dict[str, Any]) -> dict[str, Any]:
+    """The local-only view of a plan that a person reviews before approving it."""
+    return {
+        "destructive_fingerprint": str(plan.get("destructive_fingerprint") or ""),
+        "destructive_count": int(plan.get("destructive_count") or 0),
+        "population": int(plan.get("population") or 0),
+        "destructive_ratio": float(plan.get("destructive_ratio") or 0.0),
+        "items": [dict(item) for item in plan.get("review_items") or []],
     }
 
 
@@ -373,13 +435,15 @@ def validate_mutation_plan_approval(
     approval: str,
     *,
     now: dt.datetime | None = None,
+    fingerprint_key: str = "fingerprint",
 ) -> tuple[bool, str]:
     if not approval:
         return False, "approval_missing"
     fingerprint, separator, raw_timestamp = approval.rpartition(":")
-    if not separator or len(fingerprint) != 64 or not raw_timestamp.isdigit():
+    if not separator or len(fingerprint) != 64 or not raw_timestamp.isdigit() or not fingerprint.isascii():
         return False, "approval_invalid"
-    if not secrets.compare_digest(fingerprint, str(plan["fingerprint"])):
+    expected = str(plan.get(fingerprint_key) or "")
+    if not expected.isascii() or not secrets.compare_digest(fingerprint, expected):
         return False, "approval_fingerprint_mismatch"
 
     checked_at = now or dt.datetime.now(dt.timezone.utc)
@@ -402,6 +466,7 @@ def sanitized_mutation_plan(plan: dict[str, Any], reasons: list[str] | None = No
         "destructive_ratio": round(float(plan["destructive_ratio"]), 6),
         "counts": dict(plan["counts"]),
         "destructive_counts": dict(plan["destructive_counts"]),
+        "destructive_fingerprint": str(plan.get("destructive_fingerprint") or ""),
         "reasons": list(reasons or []),
     }
 
@@ -421,6 +486,10 @@ def enforce_mutation_plan(
         f"population={plan['population']}, destructive_ratio={ratio_percent:.2f}%"
     )
     print(f"Mutation plan fingerprint: {plan['fingerprint']}")
+    if config.get("_mutation_plan_preview"):
+        # Every write in both sync modes happens after this point, so a
+        # preview can return the complete plan without touching anything.
+        raise MutationPlanPreview(plan, reasons)
     if not reasons:
         return
 
@@ -436,6 +505,17 @@ def enforce_mutation_plan(
         str(config.get("_mutation_plan_approval") or ""),
         now=now,
     )
+    destructive_approval = str(config.get("_mutation_plan_destructive_approval") or "")
+    if not approved and destructive_approval:
+        # Set only internally, after a person reviewed exactly this set of
+        # deletions and completions in the prompt or the manager.
+        approved, approval_reason = validate_mutation_plan_approval(
+            config,
+            plan,
+            destructive_approval,
+            now=now,
+            fingerprint_key="destructive_fingerprint",
+        )
     if approved:
         print("Destructive mutation plan approval accepted.")
         return
@@ -457,7 +537,7 @@ def enforce_mutation_plan(
             "mutation_plan": summary,
         },
     )
-    raise MutationPlanApprovalRequired(message, summary)
+    raise MutationPlanApprovalRequired(message, summary, mutation_plan_review(plan))
 
 
 def state_key(calendar_id: str, uid: str) -> str:
@@ -689,6 +769,11 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
     config["destructive_approval_ttl_seconds"] = max(
         60,
         int(config.get("destructive_approval_ttl_seconds") or 600),
+    )
+    config["mutation_approval_prompt"] = bool(config.get("mutation_approval_prompt"))
+    config["mutation_approval_prompt_repeat_seconds"] = max(
+        600,
+        int(config.get("mutation_approval_prompt_repeat_seconds") or 21600),
     )
     config["_mutation_plan_approval"] = str(getattr(args, "approve_mutation_plan", "") or "").strip()
     config["lookahead_days"] = int(config["lookahead_days"])
@@ -2554,6 +2639,8 @@ def plan_google_task_changes_to_reminders(
                         "delete",
                         [list_title, tasklist_id, uid, stable_id],
                         destructive=True,
+                        list_title=list_title,
+                        title=title,
                     )
                 )
 
@@ -2648,6 +2735,8 @@ def plan_google_task_changes_to_reminders(
                                 operation_name,
                                 [list_title, tasklist_id, uid],
                                 destructive=operation_name == "complete",
+                                list_title=list_title,
+                                title=title,
                             )
                         )
                     continue
@@ -2674,6 +2763,8 @@ def plan_google_task_changes_to_reminders(
                     operation_name,
                     [list_title, tasklist_id, uid],
                     destructive=operation_name == "complete",
+                    list_title=list_title,
+                    title=title,
                 )
             )
 
@@ -3058,8 +3149,13 @@ def doctor_next_step(
         return "Back up the private status file, repair its JSON, then rerun doctor."
     if status_result == "missing":
         return "Run a reviewed first dry-run with --no-delete-stale before enabling normal synchronization."
+    if status_state == "awaiting_mutation_approval":
+        return (
+            "A large deletion/completion plan is waiting for your answer while other changes keep syncing. "
+            "Answer the on-screen prompt, or run the stable runtime's manage command and choose approve."
+        )
     if status_state == "blocked_mutation_plan":
-        return "Review a new dry-run and its mutation counts before approving any write."
+        return "Run the stable runtime's manage command and choose approve to review the plan, then apply or hold it."
     if status_state == "account_binding_required":
         return (
             "Run the stable runtime's manage command and choose reconnect. "
@@ -3227,6 +3323,12 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         except (TypeError, ValueError):
             failure_count = 0
         print(f"  Consecutive failures: {failure_count}")
+        pending = pending_destructive_counts(status)
+        if pending:
+            print(
+                "  Pending destructive changes: "
+                + ", ".join(f"{key}={count}" for key, count in pending.items())
+            )
         if status.get("last_error"):
             print("  Last sync error: recorded; details hidden to protect credentials and local paths")
 
@@ -3285,7 +3387,25 @@ def collect_management_snapshot(config: dict[str, Any]) -> dict[str, Any]:
         "last_success_at": status.get("last_success_at"),
         "updated_at": status.get("updated_at"),
         "failure_count": failure_count,
+        "pending_destructive_counts": pending_destructive_counts(status),
     }
+
+
+def pending_destructive_counts(status: dict[str, Any]) -> dict[str, int]:
+    """Counts of a plan still waiting for a decision; hashes and counts only."""
+    if str(status.get("state") or "") not in {"awaiting_mutation_approval", "blocked_mutation_plan"}:
+        return {}
+    plan = status.get("mutation_plan")
+    counts = plan.get("destructive_counts") if isinstance(plan, dict) else None
+    if not isinstance(counts, dict):
+        return {}
+    pending: dict[str, int] = {}
+    for key, value in counts.items():
+        try:
+            pending[str(key)] = max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    return dict(sorted(pending.items()))
 
 
 def management_condition(snapshot: dict[str, Any]) -> tuple[str, str, str]:
@@ -3308,11 +3428,17 @@ def management_condition(snapshot: dict[str, Any]) -> tuple[str, str, str]:
             "Google 로그인이 만료되었거나 인증 파일을 사용할 수 없습니다.",
             "'Google 연결 복구'를 선택해 브라우저 로그인을 완료하세요.",
         )
+    if state == "awaiting_mutation_approval":
+        return (
+            "mutation_approval_pending",
+            "대량 완료·삭제 변경이 확인을 기다립니다. 그 밖의 변경은 계속 동기화됩니다.",
+            "화면의 확인 창에서 답하거나 '대량 변경 검토 후 적용'을 선택하세요.",
+        )
     if state == "blocked_mutation_plan":
         return (
             "mutation_blocked",
-            "대량 완료·삭제 계획이 안전 기준을 넘어 동기화가 멈췄습니다.",
-            "수동 dry-run 결과를 검토하기 전에는 쓰기를 재개하지 마세요.",
+            "대량 완료·삭제 계획이 안전 기준을 넘어 확인이 필요합니다.",
+            "'대량 변경 검토 후 적용'을 선택해 목록을 확인한 뒤 적용하거나 보류하세요.",
         )
     if snapshot["agent_loaded"] is False:
         return (
@@ -3372,6 +3498,12 @@ def print_management_summary(config: dict[str, Any]) -> dict[str, Any]:
     else:
         print(f"백그라운드: {'실행 중' if snapshot['agent_loaded'] else '중지됨'}")
     print(f"Google 인증 파일: {'준비됨' if snapshot['auth_material_ready'] else '없음'}")
+    pending = snapshot.get("pending_destructive_counts") or {}
+    if pending:
+        print(
+            "대기 중인 대량 변경: "
+            + ", ".join(f"{mutation_review_label(key)} {count}건" for key, count in pending.items())
+        )
     print(f"권장 조치: {action}")
     return snapshot
 
@@ -3638,7 +3770,7 @@ def management_restart(config: dict[str, Any], args: argparse.Namespace) -> None
     if not snapshot["running_from_stable_runtime"]:
         raise ManagementActionError("재시작은 설치된 안정 실행 릴리스의 관리 도구에서만 허용됩니다.")
     condition = management_condition(snapshot)[0]
-    if condition in {"account_binding_required", "auth_required", "mutation_blocked"}:
+    if condition in {"account_binding_required", "auth_required"}:
         raise ManagementActionError("원인을 해결하지 않은 재시작은 도움이 되지 않습니다. 먼저 'Google 연결 복구'를 실행하세요.")
     if not management_confirm(args, "백그라운드 동기화를 다시 시작할까요?"):
         print("변경 없이 취소했습니다.")
@@ -3647,6 +3779,130 @@ def management_restart(config: dict[str, Any], args: argparse.Namespace) -> None
         stop_management_agent(snapshot)
     start_management_agent(snapshot)
     print("백그라운드 동기화를 다시 시작했습니다.")
+
+
+def preview_mutation_plan(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Compute the next sync's complete plan without writing anything."""
+    preview_config = dict(config)
+    preview_config["_mutation_plan_preview"] = True
+    preview_config["_mutation_plan_approval"] = ""
+    preview_config["_mutation_plan_destructive_approval"] = ""
+    preview_config["auto_reauth_browser"] = False
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            run_sync(preview_config, dry_run=True)
+    except MutationPlanPreview as preview:
+        return preview.plan
+    return None
+
+
+def run_management_sync(config: dict[str, Any], *, destructive_approval: str) -> None:
+    """One live sync from the manager, recorded like a scheduler cycle. Hold the lock."""
+    live_config = dict(config)
+    live_config["_mutation_plan_approval"] = ""
+    live_config["_mutation_plan_destructive_approval"] = destructive_approval
+    live_config["auto_reauth_browser"] = False
+    write_sync_status(
+        live_config,
+        {"state": "running", "last_start_at": utc_now_text(), "last_error": "", "mutation_plan": None},
+    )
+    try:
+        run_sync(live_config, dry_run=False)
+    except MutationPlanApprovalRequired:
+        # enforce_mutation_plan has already recorded the blocked plan.
+        raise
+    except AccountBindingRequired as exc:
+        write_sync_status(
+            live_config,
+            {"state": "account_binding_required", "last_end_at": utc_now_text(), "last_error": str(exc)},
+        )
+        raise
+    except AuthenticationRequired as exc:
+        write_sync_status(
+            live_config,
+            {"state": "auth_required", "last_end_at": utc_now_text(), "last_error": str(exc)},
+        )
+        raise
+    except (Exception, SystemExit) as exc:
+        write_sync_status(
+            live_config,
+            {"state": "failed", "last_end_at": utc_now_text(), "last_error": str(exc)},
+        )
+        raise
+    write_sync_status(
+        live_config,
+        {
+            "state": "ok",
+            "last_end_at": utc_now_text(),
+            "last_success_at": utc_now_text(),
+            **auto_reauth_failure_epoch_reset_updates(),
+            "last_error": "",
+            "mutation_plan": None,
+            "consecutive_failures": 0,
+            MUTATION_APPROVAL_STATUS_KEY: None,
+        },
+    )
+
+
+def management_approve(config: dict[str, Any], args: argparse.Namespace) -> None:
+    """Review a blocked bulk change in Terminal, then apply it or hold it."""
+    snapshot = print_management_summary(config)
+    if not snapshot["running_from_stable_runtime"]:
+        raise ManagementActionError("대량 변경 적용은 설치된 안정 실행 릴리스의 관리 도구에서만 허용됩니다.")
+    condition = management_condition(snapshot)[0]
+    if condition == "setup_required":
+        raise ManagementActionError("검토된 main 릴리스를 setup-new-mac.sh로 다시 설치한 뒤 시도하세요.")
+    if condition in {"account_binding_required", "auth_required"}:
+        raise ManagementActionError("먼저 'Google 연결 복구'로 연결 문제를 해결하세요.")
+
+    print("\n백그라운드 동기화를 잠시 멈추고 다음 동기화 계획을 계산합니다. 아직 아무것도 바꾸지 않습니다.")
+    was_loaded = stop_management_agent(snapshot)
+    try:
+        with sync_lock(config, wait=True) as acquired:
+            if not acquired:
+                raise ManagementActionError("다른 동기화가 실행 중입니다. 잠시 뒤 다시 시도하세요.")
+            plan = preview_mutation_plan(config)
+            if plan is None or not mutation_plan_limit_reasons(config, plan):
+                print("\n승인이 필요한 대량 변경이 없습니다. 백그라운드 동기화가 평소처럼 처리합니다.")
+                return
+            review = mutation_plan_review(plan)
+            print_mutation_review(review)
+            if not management_confirm(args, "\n위 변경을 Apple 미리 알림과 Google Tasks에 그대로 적용할까요?"):
+                write_sync_status(
+                    config,
+                    {
+                        MUTATION_APPROVAL_STATUS_KEY: mutation_approval_memory(
+                            review["destructive_fingerprint"],
+                            "hold",
+                            now=utc_now(),
+                            prompted=True,
+                        )
+                    },
+                )
+                print(
+                    "적용하지 않았습니다. 삭제·완료만 보류하고 나머지는 계속 동기화하며, "
+                    f"{korean_duration(int(config['mutation_approval_prompt_repeat_seconds']))} 뒤 다시 묻습니다."
+                )
+                return
+            backup_dir = backup_management_files(config, "approve")
+            print(f"비공개 백업 완료: {backup_dir}")
+            token = mutation_plan_approval_token({"fingerprint": review["destructive_fingerprint"]})
+            try:
+                run_management_sync(config, destructive_approval=token)
+            except MutationPlanApprovalRequired as exc:
+                raise ManagementActionError(
+                    "확인하는 사이 변경 계획이 바뀌어 적용하지 않았습니다. 다시 실행해 새 계획을 확인하세요."
+                ) from exc
+            print("\n적용 완료: 확인한 대량 변경을 반영했습니다.")
+    finally:
+        if was_loaded:
+            try:
+                start_management_agent(snapshot)
+                print("백그라운드 동기화를 다시 시작했습니다.")
+            except ManagementActionError:
+                print("주의: 백그라운드 작업을 자동으로 다시 시작하지 못했습니다. '백그라운드 다시 시작'을 선택하세요.")
+        elif snapshot.get("agent_loaded") is False:
+            print("백그라운드 동기화는 꺼져 있습니다. 필요하면 '백그라운드 다시 시작'을 선택하세요.")
 
 
 def management_online_check(config: dict[str, Any]) -> bool:
@@ -3674,6 +3930,9 @@ def run_management_action(config: dict[str, Any], args: argparse.Namespace, acti
         return True
     if action == "restart":
         management_restart(config, args)
+        return True
+    if action == "approve":
+        management_approve(config, args)
         return True
     raise ManagementActionError(f"지원하지 않는 관리 작업입니다: {action}")
 
@@ -3705,18 +3964,19 @@ def cmd_manage(args: argparse.Namespace) -> None:
         print("2. Google 연결 실제 확인 (토큰 갱신 가능)")
         print("3. Google 연결 복구 및 안전 재연결")
         print("4. 백그라운드 다시 시작")
+        print("5. 대량 변경 검토 후 적용")
         print("0. 종료")
         try:
             choice = input("선택: ").strip()
         except EOFError:
             choice = "0"
-        action_by_choice = {"1": "status", "2": "check", "3": "reconnect", "4": "restart"}
+        action_by_choice = {"1": "status", "2": "check", "3": "reconnect", "4": "restart", "5": "approve"}
         if choice == "0":
             print("관리 도구를 종료합니다.")
             return
         selected = action_by_choice.get(choice)
         if not selected:
-            print("0~4 중 하나를 선택하세요.")
+            print("0~5 중 하나를 선택하세요.")
             continue
         try:
             run_management_action(config, args, selected)
@@ -4021,6 +4281,7 @@ def plan_google_task_outbound_mutations(
             list_title = str(candidate.get("list_title") or "")
             task = candidate.get("task") if isinstance(candidate.get("task"), dict) else None
             record = candidate.get("record") if isinstance(candidate.get("record"), dict) else None
+            review_title = str((task or {}).get("title") or (record or {}).get("title") or "")
             completed_item = completed_by_list.get(list_title, {}).get(uid)
             if config["tasks_complete_stale"] and completed_item:
                 _body, digest, _reminder = completed_item
@@ -4039,6 +4300,8 @@ def plan_google_task_outbound_mutations(
                             "complete",
                             [list_title, tasklist_id, uid, task_id],
                             destructive=True,
+                            list_title=list_title,
+                            title=review_title,
                         )
                     )
                 continue
@@ -4048,6 +4311,8 @@ def plan_google_task_outbound_mutations(
                     "delete",
                     [list_title, tasklist_id, uid, task_id],
                     destructive=True,
+                    list_title=list_title,
+                    title=review_title,
                 )
             )
 
@@ -4072,6 +4337,8 @@ def plan_google_task_outbound_mutations(
                             "dedupe_delete",
                             [list_title, tasklist_id, task_id],
                             destructive=True,
+                            list_title=list_title,
+                            title=str(task.get("title") or ""),
                         )
                     )
 
@@ -4135,12 +4402,14 @@ def plan_google_calendar_outbound_mutations(
             if uid not in desired_uids and event.get("id"):
                 stale[uid] = str(event["id"])
         for uid, event_id in stale.items():
+            record = state_record(state, calendar_id, uid) or {}
             actions.append(
                 planned_mutation(
                     "google_calendar",
                     "delete",
                     [calendar_id, uid, event_id],
                     destructive=True,
+                    title=str((existing_by_uid.get(uid) or {}).get("summary") or record.get("title") or ""),
                 )
             )
         for event in duplicates:
@@ -4152,6 +4421,7 @@ def plan_google_calendar_outbound_mutations(
                         "dedupe_delete",
                         [calendar_id, event_id],
                         destructive=True,
+                        title=str(event.get("summary") or ""),
                     )
                 )
     return actions
@@ -4879,6 +5149,494 @@ def notify_sync_problem(config: dict[str, Any], message: str) -> None:
     )
 
 
+MUTATION_APPROVAL_STATUS_KEY = "mutation_approval"
+MUTATION_APPROVAL_DECISIONS = {"", "apply", "hold", "unanswered", "unavailable"}
+# A plan has to look the same on consecutive cycles before anyone is asked, so
+# a momentary partial Reminders export cannot put a deletion question on screen.
+MUTATION_APPROVAL_SETTLE_CYCLES = 2
+# A plan that keeps changing is asked about at most this often.
+MUTATION_APPROVAL_NEW_PLAN_GAP_SECONDS = 600
+MUTATION_APPROVAL_DIALOG_SECONDS = 43200
+MUTATION_APPROVAL_POLL_SECONDS = 2.0
+MUTATION_APPROVAL_DIALOG_TITLE = "미리 알림 동기화: 대량 변경 확인"
+MUTATION_APPROVAL_APPLY_LABEL = "적용"
+MUTATION_APPROVAL_HOLD_LABEL = "보류"
+MUTATION_REVIEW_LABELS = {
+    "apple_reminders.complete": "Apple 미리 알림에서 완료 처리 (Google에서 완료됨)",
+    "apple_reminders.delete": "Apple 미리 알림에서 삭제 (Google에서 지워짐)",
+    "google_calendar.dedupe_delete": "Google Calendar 중복 일정 정리",
+    "google_calendar.delete": "Google Calendar 일정 삭제 (Apple에서 지워짐)",
+    "google_tasks.complete": "Google Tasks에서 완료 처리 (Apple에서 완료됨)",
+    "google_tasks.dedupe_delete": "Google Tasks 중복 항목 정리",
+    "google_tasks.delete": "Google Tasks에서 삭제 (Apple에서 지워짐)",
+}
+# Plain ASCII on purpose, and no user-visible text inside it. The dialog body
+# carries reminder titles, so it travels in the child's environment (readable
+# only by this user) rather than in argv (visible to every local user through
+# ps), and is read by a constant shell command that never re-evaluates it.
+MUTATION_APPROVAL_TEXT_ENV = "IRSYNC_APPROVAL_TEXT"
+MUTATION_APPROVAL_DIALOG_SCRIPT = r"""
+on run argv
+  set dialogTitle to item 1 of argv
+  set holdLabel to item 2 of argv
+  set applyLabel to item 3 of argv
+  set waitSeconds to (item 4 of argv) as integer
+  set dialogText to do shell script "printf '%s' \"$IRSYNC_APPROVAL_TEXT\"" without altering line endings
+  try
+    activate
+  end try
+  with timeout of (waitSeconds + 60) seconds
+    set answer to display dialog dialogText with title dialogTitle buttons {holdLabel, applyLabel} default button holdLabel with icon caution giving up after waitSeconds
+  end timeout
+  if gave up of answer then return "timeout"
+  if button returned of answer is applyLabel then return "apply"
+  return "hold"
+end run
+"""
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def mutation_review_label(key: str) -> str:
+    return MUTATION_REVIEW_LABELS.get(key, key)
+
+
+def mutation_review_item_text(item: dict[str, Any], limit: int = 60) -> str:
+    title = " ".join(str(item.get("title") or "").split()) or "(제목 없음)"
+    list_title = " ".join(str(item.get("list") or "").split())
+    return truncate_notification_text(f"[{list_title}] {title}" if list_title else title, limit)
+
+
+def mutation_review_by_list(items: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        groups.setdefault(str(item.get("list") or ""), []).append(item)
+    return sorted(groups.items(), key=lambda entry: (-len(entry[1]), entry[0]))
+
+
+def mutation_review_by_operation(review: dict[str, Any]) -> list[tuple[str, list[dict[str, Any]]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in review.get("items") or []:
+        if isinstance(item, dict):
+            groups.setdefault(str(item.get("operation") or ""), []).append(item)
+    return sorted(groups.items())
+
+
+def mutation_review_samples(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Pick examples round-robin across lists so one large list cannot hide the rest."""
+    queues = [list(group) for _list_title, group in mutation_review_by_list(items)]
+    picked: list[dict[str, Any]] = []
+    while len(picked) < limit and any(queues):
+        for queue in queues:
+            if queue and len(picked) < limit:
+                picked.append(queue.pop(0))
+    return picked
+
+
+def korean_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600}시간"
+    return f"{max(1, seconds // 60)}분"
+
+
+def mutation_approval_dialog_text(review: dict[str, Any], repeat_seconds: int, sample_limit: int = 5) -> str:
+    items = [item for item in review.get("items") or [] if isinstance(item, dict)]
+    lines = ["한 번에 반영하기에는 삭제·완료 변경이 많아 확인이 필요합니다.", ""]
+    for key, group in mutation_review_by_operation(review):
+        lines.append(f"{mutation_review_label(key)}: {len(group)}건")
+        by_list = mutation_review_by_list(group)
+        if any(list_title for list_title, _entries in by_list):
+            lines.append(
+                "  " + " · ".join(f"{list_title or '목록 없음'} {len(entries)}" for list_title, entries in by_list)
+            )
+    samples = mutation_review_samples(items, sample_limit)
+    if samples:
+        lines.extend(["", "예시"])
+        lines.extend(f"· {mutation_review_item_text(item)}" for item in samples)
+        if len(items) > len(samples):
+            lines.append(f"외 {len(items) - len(samples)}건")
+    lines.extend(
+        [
+            "",
+            "직접 지우거나 완료한 것이 맞다면 '적용'을 누르세요.",
+            f"'보류'를 누르면 삭제·완료만 멈추고 나머지는 계속 동기화하며, "
+            f"{korean_duration(repeat_seconds)} 뒤 다시 묻습니다.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def print_mutation_review(review: dict[str, Any]) -> None:
+    ratio = float(review.get("destructive_ratio") or 0.0) * 100
+    print(
+        f"\n대기 중인 대량 변경: {int(review.get('destructive_count') or 0)}건 "
+        f"(관리 중인 항목 {int(review.get('population') or 0)}개 중 {ratio:.1f}%)"
+    )
+    for key, group in mutation_review_by_operation(review):
+        print(f"\n{mutation_review_label(key)}: {len(group)}건")
+        for list_title, entries in mutation_review_by_list(group):
+            if list_title:
+                print(f"  [{list_title}] {len(entries)}건")
+            for item in entries:
+                print(f"    - {' '.join(str(item.get('title') or '').split()) or '(제목 없음)'}")
+
+
+def launch_mutation_approval_dialog(title: str, text: str, wait_seconds: int) -> Any:
+    """Open the approval question without blocking the scheduler; None if impossible."""
+    if sys.platform != "darwin" or not shutil.which("osascript"):
+        return None
+    environment = dict(os.environ)
+    environment[MUTATION_APPROVAL_TEXT_ENV] = text
+    try:
+        return subprocess.Popen(
+            [
+                "osascript",
+                "-e",
+                MUTATION_APPROVAL_DIALOG_SCRIPT,
+                title,
+                MUTATION_APPROVAL_HOLD_LABEL,
+                MUTATION_APPROVAL_APPLY_LABEL,
+                str(max(1, int(wait_seconds))),
+            ],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def parse_mutation_approval_answer(returncode: int | None, stdout: str, stderr: str) -> str:
+    """Map the dialog process result to apply, hold, timeout, or unavailable."""
+    if returncode == 0:
+        answer = str(stdout or "").strip()
+        # Anything unexpected is treated as the safe answer.
+        return answer if answer in {"apply", "hold", "timeout"} else "hold"
+    if "-128" in str(stderr or ""):
+        return "hold"
+    return "unavailable"
+
+
+def restored_mutation_approval(status: dict[str, Any]) -> dict[str, Any]:
+    raw = status.get(MUTATION_APPROVAL_STATUS_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    fingerprint = str(raw.get("destructive_fingerprint") or "")
+    decision = str(raw.get("decision") or "")
+    if (
+        len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+        or decision not in MUTATION_APPROVAL_DECISIONS
+    ):
+        return {}
+    return {
+        "destructive_fingerprint": fingerprint,
+        "decision": decision,
+        "decided_at": raw.get("decided_at") if parse_status_time(raw.get("decided_at")) else None,
+        "prompted_at": raw.get("prompted_at") if parse_status_time(raw.get("prompted_at")) else None,
+    }
+
+
+def mutation_approval_memory(
+    fingerprint: str,
+    decision: str,
+    *,
+    now: dt.datetime,
+    previous: dict[str, Any] | None = None,
+    prompted: bool = False,
+) -> dict[str, Any]:
+    now_text = now.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+    same_plan = bool(previous and previous.get("destructive_fingerprint") == fingerprint)
+    if prompted:
+        prompted_at = now_text
+    elif same_plan:
+        prompted_at = (previous or {}).get("prompted_at")
+    else:
+        prompted_at = None
+    return {
+        "destructive_fingerprint": fingerprint,
+        "decision": decision,
+        "decided_at": now_text if decision else None,
+        "prompted_at": prompted_at,
+    }
+
+
+class MutationPlanApprovals:
+    """The scheduler's side of asking a person about a blocked destructive plan.
+
+    At most one question is open, in its own process, so the scheduler keeps
+    syncing everything except the held deletions and completions while it
+    waits. Only the answer, a hash of the plan's destructive set, and
+    timestamps are persisted in status.json; titles stay in the dialog text.
+    """
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+        self.memory = restored_mutation_approval(read_sync_status(config))
+        self.process: Any = None
+        self.process_fingerprint = ""
+        self.observed_fingerprint = ""
+        self.settled_cycles = 0
+        self.blocked_fingerprint = ""
+        self.blocked_streak = 0
+
+    def dialog_open(self) -> bool:
+        return self.process is not None
+
+    def dialog_running(self) -> bool:
+        if self.process is None:
+            return False
+        try:
+            return self.process.poll() is None
+        except OSError:
+            return False
+
+    def remember(self, fingerprint: str, decision: str, *, now: dt.datetime | None = None, prompted: bool = False) -> None:
+        self.memory = mutation_approval_memory(
+            fingerprint,
+            decision,
+            now=now or utc_now(),
+            previous=self.memory,
+            prompted=prompted,
+        )
+        write_sync_status(self.config, {MUTATION_APPROVAL_STATUS_KEY: self.memory})
+
+    def observe(self, summary: dict[str, Any] | None, review: dict[str, Any] | None) -> None:
+        """Count how many consecutive cycles produced this blocked plan."""
+        fingerprint = str((summary or {}).get("fingerprint") or "")
+        self.blocked_fingerprint, self.blocked_streak = next_blocked_plan_streak(
+            self.blocked_fingerprint,
+            self.blocked_streak,
+            fingerprint,
+        )
+        destructive = str((review or {}).get("destructive_fingerprint") or "")
+        if destructive and destructive == self.observed_fingerprint:
+            self.settled_cycles += 1
+        else:
+            self.observed_fingerprint = destructive
+            self.settled_cycles = 1 if destructive else 0
+
+    def collect(self, now: dt.datetime | None = None) -> None:
+        """Record the answer of a question that has closed."""
+        if self.process is None or self.dialog_running():
+            return
+        process, fingerprint = self.process, self.process_fingerprint
+        self.process, self.process_fingerprint = None, ""
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            stdout, stderr = "", ""
+        answer = parse_mutation_approval_answer(process.returncode, stdout or "", stderr or "")
+        decision = "unanswered" if answer == "timeout" else answer
+        print(f"Bulk change prompt closed: {decision}.", flush=True)
+        self.remember(fingerprint, decision, now=now)
+        if decision == "unavailable":
+            self.notify_manager_fallback()
+
+    def approval_token(self, fingerprint: str, now: dt.datetime | None = None) -> str:
+        """A destructive-set approval if the user approved exactly this set recently."""
+        memory = self.memory
+        if not fingerprint or memory.get("destructive_fingerprint") != fingerprint or memory.get("decision") != "apply":
+            return ""
+        decided_at = parse_status_time(memory.get("decided_at"))
+        if not decided_at:
+            return ""
+        age_seconds = ((now or utc_now()) - decided_at).total_seconds()
+        if age_seconds > int(self.config["destructive_approval_ttl_seconds"]):
+            return ""
+        return f"{fingerprint}:{int(decided_at.timestamp())}"
+
+    def should_ask(self, fingerprint: str, now: dt.datetime) -> bool:
+        if not fingerprint:
+            return False
+        memory = self.memory
+        decision = str(memory.get("decision") or "")
+        decided_at = parse_status_time(memory.get("decided_at"))
+        repeat = int(self.config["mutation_approval_prompt_repeat_seconds"])
+        # "Hold" means no bulk-change questions for a while, whatever the plan.
+        if decision in {"hold", "unavailable"} and decided_at and (now - decided_at).total_seconds() < repeat:
+            return False
+        if memory.get("destructive_fingerprint") == fingerprint:
+            return not self.approval_token(fingerprint, now)
+        prompted_at = parse_status_time(memory.get("prompted_at"))
+        return not (prompted_at and (now - prompted_at).total_seconds() < MUTATION_APPROVAL_NEW_PLAN_GAP_SECONDS)
+
+    def consider(self, review: dict[str, Any] | None, now: dt.datetime | None = None) -> None:
+        """Ask about this plan once it has settled and nobody has answered for it."""
+        review = review or {}
+        fingerprint = str(review.get("destructive_fingerprint") or "")
+        if self.process is not None:
+            if self.process_fingerprint == fingerprint:
+                return
+            print("Closing a bulk change prompt whose plan has changed.", flush=True)
+            self.close()
+        if not fingerprint or fingerprint != self.observed_fingerprint:
+            return
+        if self.settled_cycles < MUTATION_APPROVAL_SETTLE_CYCLES:
+            return
+        now = now or utc_now()
+        if not self.should_ask(fingerprint, now):
+            return
+        process = None
+        if self.config.get("mutation_approval_prompt"):
+            process = launch_mutation_approval_dialog(
+                MUTATION_APPROVAL_DIALOG_TITLE,
+                mutation_approval_dialog_text(review, int(self.config["mutation_approval_prompt_repeat_seconds"])),
+                MUTATION_APPROVAL_DIALOG_SECONDS,
+            )
+        if process is None:
+            self.remember(fingerprint, "unavailable", now=now, prompted=True)
+            self.notify_manager_fallback()
+            return
+        self.process, self.process_fingerprint = process, fingerprint
+        self.remember(fingerprint, "", now=now, prompted=True)
+        print("Asked the signed-in user to review a large destructive mutation plan.", flush=True)
+        notify_sync_problem(self.config, "대량 삭제·완료 확인 창을 열었습니다. '적용' 또는 '보류'를 선택하세요.")
+
+    def notify_manager_fallback(self) -> None:
+        notify_sync_problem(
+            self.config,
+            "대량 삭제·완료 확인이 필요합니다. 'Google Tasks 동기화 관리'에서 검토한 뒤 적용하거나 보류하세요.",
+        )
+
+    def resolve(self) -> None:
+        """The plan is gone (applied, undone, or never real): drop its question."""
+        self.close()
+        self.observed_fingerprint, self.settled_cycles = "", 0
+        self.blocked_fingerprint, self.blocked_streak = "", 0
+        if self.memory:
+            self.memory = {}
+            write_sync_status(self.config, {MUTATION_APPROVAL_STATUS_KEY: None})
+
+    def close(self) -> None:
+        process, self.process, self.process_fingerprint = self.process, None, ""
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            process.communicate(timeout=1)
+        except Exception:  # noqa: BLE001 - closing a stale question must never stop the scheduler.
+            pass
+
+
+def held_destructive_config(config: dict[str, Any]) -> dict[str, Any]:
+    """The same sync with every deletion and completion held back."""
+    held = dict(config)
+    held["delete_stale"] = False
+    held["_disable_delete_propagation"] = True
+    held["_mutation_plan_approval"] = ""
+    held["_mutation_plan_destructive_approval"] = ""
+    return held
+
+
+def run_scheduled_sync(config: dict[str, Any], approvals: MutationPlanApprovals) -> dict[str, Any]:
+    """Run one scheduler cycle. The caller holds the sync lock.
+
+    A plan over the destructive limits is still never written without an
+    approval. Instead of stopping the whole sync, the cycle asks the signed-in
+    user once the plan has settled, applies exactly the destructive set they
+    approved, and until then syncs everything else with deletions and
+    completions held back.
+    """
+    try:
+        run_sync(config, dry_run=False)
+    except MutationPlanApprovalRequired as exc:
+        blocked = exc
+    else:
+        approvals.resolve()
+        return {"outcome": "ok"}
+
+    eprint(f"Sync loop blocked by mutation plan: {blocked}")
+    approvals.observe(blocked.summary, blocked.review)
+    if should_auto_approve_blocked_plan(config, approvals.blocked_streak):
+        print(
+            f"Auto-approving destructive mutation plan after {approvals.blocked_streak} identical consecutive plans.",
+            flush=True,
+        )
+        approved = dict(config)
+        approved["_mutation_plan_approval"] = mutation_plan_approval_token(
+            {"fingerprint": approvals.blocked_fingerprint}
+        )
+        run_sync(approved, dry_run=False)
+        approvals.resolve()
+        return {"outcome": "applied"}
+
+    token = approvals.approval_token(str(blocked.review.get("destructive_fingerprint") or ""))
+    if token:
+        print("Applying the destructive mutation plan the signed-in user approved.", flush=True)
+        approved = dict(config)
+        approved["_mutation_plan_destructive_approval"] = token
+        try:
+            run_sync(approved, dry_run=False)
+        except MutationPlanApprovalRequired as changed:
+            eprint(f"Approved mutation plan changed before it was applied: {changed}")
+            blocked = changed
+            approvals.observe(blocked.summary, blocked.review)
+        else:
+            approvals.resolve()
+            return {"outcome": "applied"}
+
+    approvals.consider(blocked.review)
+    print("Holding deletions and completions until the plan is approved; syncing everything else.", flush=True)
+    run_sync(held_destructive_config(config), dry_run=False)
+    return {"outcome": "held", "summary": blocked.summary}
+
+
+def record_scheduled_sync_result(config: dict[str, Any], result: dict[str, Any]) -> None:
+    finished = utc_now_text()
+    if result.get("outcome") == "held":
+        write_sync_status(
+            config,
+            {
+                "state": "awaiting_mutation_approval",
+                "last_end_at": finished,
+                "last_success_at": finished,
+                **auto_reauth_failure_epoch_reset_updates(),
+                "last_error": "",
+                "mutation_plan": result.get("summary"),
+                "consecutive_failures": 0,
+            },
+        )
+        return
+    write_sync_status(
+        config,
+        {
+            "state": "ok",
+            "last_end_at": finished,
+            "last_success_at": finished,
+            **auto_reauth_failure_epoch_reset_updates(),
+            "last_error": "",
+            "mutation_plan": None,
+            "consecutive_failures": 0,
+        },
+    )
+    notify_sync_ok(config)
+
+
+def wait_for_next_cycle(interval: int, approvals: MutationPlanApprovals) -> None:
+    """Sleep until the next cycle, waking early once an open question is answered."""
+    if not approvals.dialog_open():
+        time.sleep(interval)
+        return
+    deadline = time.monotonic() + interval
+    while approvals.dialog_running():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(MUTATION_APPROVAL_POLL_SECONDS, remaining))
+
+
 def local_reauth_can_satisfy_binding(config: dict[str, Any]) -> bool:
     """Whether a browser OAuth login could produce the credential the state expects.
 
@@ -5108,12 +5866,12 @@ def cmd_run_loop(args: argparse.Namespace) -> None:
 
     print(f"Starting sync loop every {interval} seconds. Press Ctrl-C to stop.", flush=True)
     consecutive_failures = restored_consecutive_failures(read_sync_status(config))
-    blocked_fingerprint = ""
-    blocked_streak = 0
+    approvals = MutationPlanApprovals(config)
     while True:
         started = utc_now_text()
         print(f"[{started}] sync start", flush=True)
         try:
+            approvals.collect()
             with sync_lock(config, wait=False) as acquired:
                 if acquired:
                     write_sync_status(
@@ -5126,32 +5884,19 @@ def cmd_run_loop(args: argparse.Namespace) -> None:
                             "consecutive_failures": consecutive_failures,
                         },
                     )
-                    run_sync(config, dry_run=False)
+                    result = run_scheduled_sync(config, approvals)
                     consecutive_failures = 0
-                    blocked_fingerprint, blocked_streak = "", 0
-                    write_sync_status(
-                        config,
-                        {
-                            "state": "ok",
-                            "last_end_at": utc_now_text(),
-                            "last_success_at": utc_now_text(),
-                            **auto_reauth_failure_epoch_reset_updates(),
-                            "last_error": "",
-                            "consecutive_failures": consecutive_failures,
-                        },
-                    )
-                    notify_sync_ok(config)
+                    record_scheduled_sync_result(config, result)
                 else:
                     print("Another sync is already running; skipping this cycle.", flush=True)
         except KeyboardInterrupt:
+            approvals.close()
             raise
         except MutationPlanApprovalRequired as exc:
+            # Reached only when a held or an approved pass is blocked itself.
+            # The question to the user, if any, stays as it is.
             consecutive_failures += 1
             eprint(f"Sync loop blocked by mutation plan: {exc}")
-            fingerprint = str((exc.summary or {}).get("fingerprint") or "")
-            blocked_fingerprint, blocked_streak = next_blocked_plan_streak(
-                blocked_fingerprint, blocked_streak, fingerprint
-            )
             write_sync_status(
                 config,
                 {
@@ -5162,53 +5907,6 @@ def cmd_run_loop(args: argparse.Namespace) -> None:
                     "consecutive_failures": consecutive_failures,
                 },
             )
-            if should_auto_approve_blocked_plan(config, blocked_streak):
-                print(
-                    f"Auto-approving destructive mutation plan after {blocked_streak} identical consecutive plans.",
-                    flush=True,
-                )
-                try:
-                    with sync_lock(config, wait=False) as acquired:
-                        if acquired:
-                            config["_mutation_plan_approval"] = mutation_plan_approval_token(
-                                {"fingerprint": blocked_fingerprint}
-                            )
-                            try:
-                                run_sync(config, dry_run=False)
-                            finally:
-                                config["_mutation_plan_approval"] = ""
-                            consecutive_failures = 0
-                            blocked_fingerprint, blocked_streak = "", 0
-                            write_sync_status(
-                                config,
-                                {
-                                    "state": "ok",
-                                    "last_end_at": utc_now_text(),
-                                    "last_success_at": utc_now_text(),
-                                    **auto_reauth_failure_epoch_reset_updates(),
-                                    "last_error": "",
-                                    "mutation_plan": None,
-                                    "consecutive_failures": consecutive_failures,
-                                },
-                            )
-                            notify_sync_ok(config)
-                        else:
-                            print("Another sync is already running; skipping auto-approval retry.", flush=True)
-                except KeyboardInterrupt:
-                    raise
-                except Exception as retry_exc:  # noqa: BLE001 - loop must keep running
-                    eprint(f"Auto-approved sync retry failed: {retry_exc}")
-                    notify_sync_problem(
-                        config,
-                        "Bulk change auto-approval retry failed; will keep retrying on the next cycle.",
-                    )
-            else:
-                notify_sync_problem(
-                    config,
-                    "Sync paused by a large destructive change plan; it will be applied automatically if it stays identical."
-                    if int(config.get("auto_approve_destructive_loops", 0) or 0) > 0
-                    else "Sync paused because a destructive mutation plan requires explicit approval.",
-                )
         except AccountBindingRequired as exc:
             consecutive_failures += 1
             eprint(f"Sync loop account binding blocked: {exc}")
@@ -5241,20 +5939,9 @@ def cmd_run_loop(args: argparse.Namespace) -> None:
                 try:
                     with sync_lock(config, wait=False) as acquired:
                         if acquired:
-                            run_sync(config, dry_run=False)
+                            result = run_scheduled_sync(config, approvals)
                             consecutive_failures = 0
-                            write_sync_status(
-                                config,
-                                {
-                                    "state": "ok",
-                                    "last_end_at": utc_now_text(),
-                                    "last_success_at": utc_now_text(),
-                                    **auto_reauth_failure_epoch_reset_updates(),
-                                    "last_error": "",
-                                    "consecutive_failures": consecutive_failures,
-                                },
-                            )
-                            notify_sync_ok(config)
+                            record_scheduled_sync_result(config, result)
                         else:
                             print("Another sync is already running; skipping retry.", flush=True)
                 except AuthenticationRequired as retry_exc:
@@ -5282,10 +5969,6 @@ def cmd_run_loop(args: argparse.Namespace) -> None:
                             "mutation_plan": retry_exc.summary,
                             "consecutive_failures": consecutive_failures,
                         },
-                    )
-                    notify_sync_problem(
-                        config,
-                        "Sync paused because a destructive mutation plan requires explicit approval.",
                     )
                 except AccountBindingRequired as retry_exc:
                     consecutive_failures += 1
@@ -5357,8 +6040,9 @@ def cmd_run_loop(args: argparse.Namespace) -> None:
             notify_sync_problem(config, f"Sync failed: {exc}")
         print(f"[{utc_now_text()}] sync end", flush=True)
         try:
-            time.sleep(interval)
+            wait_for_next_cycle(interval, approvals)
         except KeyboardInterrupt:
+            approvals.close()
             print("Stopping sync loop.", flush=True)
             return
 
@@ -5410,7 +6094,7 @@ def build_parser() -> argparse.ArgumentParser:
     manage_parser.add_argument(
         "action",
         nargs="?",
-        choices=["menu", "status", "check", "reconnect", "restart"],
+        choices=["menu", "status", "check", "reconnect", "restart", "approve"],
         default="menu",
         help="Management action. The default opens an interactive Korean menu.",
     )

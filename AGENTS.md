@@ -9,6 +9,11 @@ user's Mac and are never proved by source CI alone.
 
 - Apple Reminders and Google Tasks stay synchronized without deleting stale
   items accidentally.
+- A plan over the destructive limits never stops the whole sync and is never
+  written unasked: the scheduler holds only deletions and completions, asks the
+  signed-in user once the plan has settled, and applies exactly the destructive
+  set that was approved. Titles appear only in that dialog or the manager,
+  never in `status.json`, argv, or a fingerprint.
 - Fresh-machine setup uses `--no-delete-stale` until the local state map has
   been rebuilt safely.
 - Only fix sync behavior backed by a reproducible case and a regression test.
@@ -73,9 +78,10 @@ test that the entrypoint fails closed before mutation.
 - `RemindersExport.swift`: reads Apple Reminders.
 - `RemindersApply.swift`: applies changes back to Apple Reminders.
 - `google-tasks-manager.command`: Finder/Terminal entrypoint for diagnosis,
-  online Google checks, confirmed reconnect, safe state rebuild, and LaunchAgent
-  restart. Recovery must back up private files before mutation and must keep
-  deletion propagation disabled while rebuilding state.
+  online Google checks, confirmed reconnect, safe state rebuild, LaunchAgent
+  restart, and reviewed approval of a blocked bulk change. Recovery must back
+  up private files before mutation and must keep deletion propagation disabled
+  while rebuilding state.
 - `setup-new-mac.sh`: verified release installer and first-sync flow.
 - `make-migration-bundle.sh`: verified first-machine bundle helper.
 - `scripts/check-release-source.sh`: fail-closed release source gate.

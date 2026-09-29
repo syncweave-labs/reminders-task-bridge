@@ -13,6 +13,26 @@ from unittest import mock
 import icloud_reminders_google_sync as sync
 
 
+REAL_LAUNCH_MUTATION_APPROVAL_DIALOG = sync.launch_mutation_approval_dialog
+REAL_SEND_MACOS_NOTIFICATION = sync.send_macos_notification
+_SCREEN_GUARDS = [
+    # No test may put a real approval dialog or notification on the
+    # developer's screen. Tests that exercise these call the saved originals.
+    mock.patch.object(sync, "launch_mutation_approval_dialog", return_value=None),
+    mock.patch.object(sync, "send_macos_notification", return_value=None),
+]
+
+
+def setUpModule() -> None:
+    for guard in _SCREEN_GUARDS:
+        guard.start()
+
+
+def tearDownModule() -> None:
+    for guard in reversed(_SCREEN_GUARDS):
+        guard.stop()
+
+
 class AccountBindingIsolationTests(unittest.TestCase):
     @staticmethod
     def binding(apple_token: str, google_token: str) -> dict[str, object]:
@@ -1872,7 +1892,7 @@ class ListPolicyTests(unittest.TestCase):
 
 
 class BlockedPlanAutoApprovalTests(unittest.TestCase):
-    def test_default_loop_keeps_repeated_destructive_plan_blocked(self) -> None:
+    def test_default_loop_never_writes_a_blocked_plan_without_an_answer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             config = sync.default_config()
             config.update({
@@ -1885,6 +1905,9 @@ class BlockedPlanAutoApprovalTests(unittest.TestCase):
             writes = []
 
             def attempt(config: dict[str, object], dry_run: bool = False) -> None:
+                if config.get("_disable_delete_propagation"):
+                    writes.append("held")
+                    return
                 sync.enforce_mutation_plan(config, plan, dry_run=dry_run)
                 writes.append("deleted")
 
@@ -1897,10 +1920,16 @@ class BlockedPlanAutoApprovalTests(unittest.TestCase):
             ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 sync.cmd_run_loop(mock.Mock())
 
-            self.assertEqual(writes, [])
-            self.assertEqual(run.call_count, 5)
-            self.assertEqual(sync.read_sync_status(config)["state"], "blocked_mutation_plan")
-            self.assertTrue(all("requires explicit approval" in call.args[1] for call in notify.call_args_list))
+            # Every cycle still syncs, but never the deletion nobody answered for.
+            self.assertEqual(writes, ["held"] * 5)
+            self.assertEqual(run.call_count, 10)
+            status = sync.read_sync_status(config)
+            self.assertEqual(status["state"], "awaiting_mutation_approval")
+            self.assertEqual(status["consecutive_failures"], 0)
+            # The dialog is unavailable here (module guard), so the user gets
+            # one pointer to the manager instead of a warning every cycle.
+            self.assertEqual(notify.call_count, 1)
+            self.assertIn("Google Tasks 동기화 관리", notify.call_args.args[1])
 
     def test_streak_counts_only_identical_consecutive_fingerprints(self) -> None:
         fp, streak = sync.next_blocked_plan_streak("", 0, "aaa")
@@ -2123,7 +2152,7 @@ class MutationPlanTests(unittest.TestCase):
                 ),
                 mock.patch.object(sync, "run_reminders_apply") as apple_mutator,
             ):
-                with self.assertRaises(sync.MutationPlanApprovalRequired):
+                with self.assertRaises(sync.MutationPlanApprovalRequired) as blocked:
                     sync.run_tasks_sync(config)
 
             self.assertEqual(FakeClient.mutations, [])
@@ -2134,6 +2163,14 @@ class MutationPlanTests(unittest.TestCase):
             self.assertNotIn("Private reminder title", visible)
             self.assertNotIn("Sensitive stale title", visible)
             self.assertEqual(status["mutation_plan"]["destructive_count"], 9)
+            # The person asked to approve sees what would go; status.json does not.
+            review = blocked.exception.review
+            self.assertEqual(review["destructive_fingerprint"], status["mutation_plan"]["destructive_fingerprint"])
+            self.assertEqual(
+                {(item["operation"], item["list"]) for item in review["items"]},
+                {("google_tasks.delete", "Personal")},
+            )
+            self.assertIn("Sensitive stale title 3", {item["title"] for item in review["items"]})
 
     def test_normal_small_change_keeps_existing_insert_behavior(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -2536,6 +2573,503 @@ class LaunchAgentLogPrivacyTests(unittest.TestCase):
 
         # A closed or already private stream must not raise either.
         sync.harden_log_stream_mode(io.StringIO())
+
+
+class FakeDialog:
+    """Stands in for the osascript approval dialog process."""
+
+    def __init__(self, answer: str = "hold", *, finished: bool = True, returncode: int = 0, stderr: str = "") -> None:
+        self.answer = answer
+        self.finished = finished
+        self.returncode = returncode
+        self.stderr = stderr
+        self.terminated = False
+
+    def poll(self) -> int | None:
+        return self.returncode if self.finished else None
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        return f"{self.answer}\n", self.stderr
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.finished = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.terminate()
+
+
+class MutationApprovalPromptTests(unittest.TestCase):
+    @staticmethod
+    def loop_config(base: Path) -> dict[str, object]:
+        config = sync.default_config()
+        config.update(
+            {
+                "state_path": str(base / "state.json"),
+                "status_path": str(base / "status.json"),
+                "sync_interval_seconds": 60,
+            }
+        )
+        return config
+
+    @staticmethod
+    def deletion_plan(titles: list[str], list_title: str = "자격증", population: int | None = None) -> dict[str, object]:
+        return sync.build_mutation_plan(
+            [
+                sync.planned_mutation(
+                    "google_tasks",
+                    "delete",
+                    [list_title, "tasklist", f"uid-{index}", f"task-{index}"],
+                    destructive=True,
+                    list_title=list_title,
+                    title=title,
+                )
+                for index, title in enumerate(titles)
+            ],
+            population if population is not None else len(titles),
+        )
+
+    def run_loop(
+        self,
+        config: dict[str, object],
+        run_sync: object,
+        cycles: int,
+        launch: object,
+    ) -> tuple[mock.Mock, mock.Mock]:
+        with mock.patch.object(sync, "load_config", return_value=config), mock.patch.object(
+            sync, "run_sync", side_effect=run_sync
+        ), mock.patch.object(sync, "harden_runtime_log_modes"), mock.patch.object(
+            sync, "launch_mutation_approval_dialog", side_effect=launch
+        ), mock.patch.object(sync, "notify_sync_problem") as notify, mock.patch.object(
+            sync, "notify_sync_ok"
+        ) as notify_ok, mock.patch.object(
+            sync, "wait_for_next_cycle", side_effect=[None] * (cycles - 1) + [KeyboardInterrupt]
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            sync.cmd_run_loop(mock.Mock())
+        return notify, notify_ok
+
+    def test_review_labels_stay_out_of_fingerprints_and_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = self.loop_config(Path(tmp_name))
+            plan = self.deletion_plan(["Private exam plan", "Private mock test"])
+            relabelled = self.deletion_plan(["Different title", "Another title"])
+            with_update = sync.build_mutation_plan(
+                [
+                    *[
+                        sync.planned_mutation(
+                            "google_tasks",
+                            "delete",
+                            ["자격증", "tasklist", f"uid-{index}", f"task-{index}"],
+                            destructive=True,
+                        )
+                        for index in range(2)
+                    ],
+                    sync.planned_mutation("google_tasks", "update", ["자격증", "tasklist", "uid-9"]),
+                ],
+                2,
+            )
+
+            self.assertEqual(plan["fingerprint"], relabelled["fingerprint"])
+            self.assertEqual(plan["destructive_fingerprint"], relabelled["destructive_fingerprint"])
+            # An unrelated update changes the plan but not the set a person approves.
+            self.assertNotEqual(plan["fingerprint"], with_update["fingerprint"])
+            self.assertEqual(plan["destructive_fingerprint"], with_update["destructive_fingerprint"])
+
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(
+                sync.MutationPlanApprovalRequired
+            ) as blocked:
+                sync.enforce_mutation_plan(config, plan, dry_run=False)
+
+            self.assertEqual(
+                sorted(item["title"] for item in blocked.exception.review["items"]),
+                ["Private exam plan", "Private mock test"],
+            )
+            visible = (Path(tmp_name) / "status.json").read_text(encoding="utf-8")
+            self.assertNotIn("Private", visible)
+            self.assertIn(plan["destructive_fingerprint"], visible)
+
+    def test_destructive_approval_accepts_only_the_reviewed_set_while_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = self.loop_config(Path(tmp_name))
+            plan = self.deletion_plan(["a", "b"])
+            issued = dt.datetime(2026, 9, 29, 5, 0, tzinfo=dt.timezone.utc)
+            config["_mutation_plan_destructive_approval"] = f"{plan['destructive_fingerprint']}:{int(issued.timestamp())}"
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                sync.enforce_mutation_plan(config, plan, dry_run=False, now=issued + dt.timedelta(seconds=30))
+
+                grown = self.deletion_plan(["a", "b", "one more"])
+                with self.assertRaises(sync.MutationPlanApprovalRequired) as mismatch:
+                    sync.enforce_mutation_plan(config, grown, dry_run=False, now=issued)
+                self.assertIn("approval_fingerprint_mismatch", mismatch.exception.summary["reasons"])
+
+                with self.assertRaises(sync.MutationPlanApprovalRequired) as expired:
+                    sync.enforce_mutation_plan(config, plan, dry_run=False, now=issued + dt.timedelta(seconds=601))
+                self.assertIn("approval_expired", expired.exception.summary["reasons"])
+
+    def test_loop_asks_once_the_plan_settles_then_applies_exactly_that_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = self.loop_config(Path(tmp_name))
+            plan = self.deletion_plan(["Private exam plan", "Private mock test", "Private review"])
+            passes: list[str] = []
+            applied = {"done": False}
+            dialogs: list[str] = []
+
+            def fake_run_sync(cfg: dict[str, object], dry_run: bool = False) -> None:
+                if cfg.get("_disable_delete_propagation"):
+                    passes.append("held")
+                    return
+                if applied["done"]:
+                    passes.append("clean")
+                    return
+                sync.enforce_mutation_plan(cfg, plan, dry_run=dry_run)
+                applied["done"] = True
+                passes.append("applied")
+
+            def launch(title: str, text: str, wait_seconds: int) -> FakeDialog:
+                dialogs.append(text)
+                return FakeDialog("apply")
+
+            notify, notify_ok = self.run_loop(config, fake_run_sync, 4, launch)
+
+            # Cycle 1 lets the plan settle, cycle 2 asks, cycle 3 applies.
+            self.assertEqual(passes, ["held", "held", "applied", "clean"])
+            self.assertEqual(len(dialogs), 1)
+            self.assertIn("Google Tasks에서 삭제 (Apple에서 지워짐): 3건", dialogs[0])
+            self.assertIn("Private exam plan", dialogs[0])
+            status = sync.read_sync_status(config)
+            self.assertEqual(status["state"], "ok")
+            self.assertIsNone(status["mutation_plan"])
+            self.assertIsNone(status["mutation_approval"])
+            self.assertNotIn("Private", json.dumps(status, ensure_ascii=False))
+            notify_ok.assert_called()
+
+    def test_hold_keeps_everything_else_syncing_and_does_not_ask_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = self.loop_config(Path(tmp_name))
+            plan = self.deletion_plan(["Private exam plan"] * 3, population=3)
+            passes: list[str] = []
+            dialogs: list[FakeDialog] = []
+
+            def fake_run_sync(cfg: dict[str, object], dry_run: bool = False) -> None:
+                if cfg.get("_disable_delete_propagation"):
+                    passes.append("held")
+                    return
+                sync.enforce_mutation_plan(cfg, plan, dry_run=dry_run)
+                passes.append("deleted")
+
+            def launch(title: str, text: str, wait_seconds: int) -> FakeDialog:
+                dialogs.append(FakeDialog("hold"))
+                return dialogs[-1]
+
+            notify, _notify_ok = self.run_loop(config, fake_run_sync, 5, launch)
+
+            self.assertEqual(passes, ["held"] * 5)
+            self.assertEqual(len(dialogs), 1)
+            status = sync.read_sync_status(config)
+            self.assertEqual(status["state"], "awaiting_mutation_approval")
+            self.assertEqual(status["consecutive_failures"], 0)
+            self.assertEqual(status["mutation_approval"]["decision"], "hold")
+            self.assertEqual(status["mutation_plan"]["destructive_count"], 3)
+            # One notice that the question opened, not one per cycle.
+            self.assertEqual(notify.call_count, 1)
+
+    def test_changed_plan_closes_the_stale_question_without_applying_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = self.loop_config(Path(tmp_name))
+            first = self.deletion_plan(["a", "b", "c"])
+            second = self.deletion_plan(["a", "b", "c", "d"])
+            plans = [first, first, second, second]
+            dialogs: list[FakeDialog] = []
+
+            def fake_run_sync(cfg: dict[str, object], dry_run: bool = False) -> None:
+                if cfg.get("_disable_delete_propagation"):
+                    return
+                sync.enforce_mutation_plan(cfg, plans.pop(0), dry_run=dry_run)
+                raise AssertionError("a blocked plan must not be written")
+
+            def launch(title: str, text: str, wait_seconds: int) -> FakeDialog:
+                dialogs.append(FakeDialog(finished=False))
+                return dialogs[-1]
+
+            self.run_loop(config, fake_run_sync, 4, launch)
+
+            self.assertEqual(len(dialogs), 1)
+            self.assertTrue(dialogs[0].terminated)
+            self.assertEqual(sync.read_sync_status(config)["state"], "awaiting_mutation_approval")
+
+    def test_unanswered_question_after_restart_is_asked_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = self.loop_config(Path(tmp_name))
+            plan = self.deletion_plan(["a", "b", "c"])
+            sync.write_sync_status(
+                config,
+                {
+                    "mutation_approval": sync.mutation_approval_memory(
+                        str(plan["destructive_fingerprint"]),
+                        "",
+                        now=sync.utc_now(),
+                        prompted=True,
+                    )
+                },
+            )
+            dialogs: list[FakeDialog] = []
+
+            def fake_run_sync(cfg: dict[str, object], dry_run: bool = False) -> None:
+                if not cfg.get("_disable_delete_propagation"):
+                    sync.enforce_mutation_plan(cfg, plan, dry_run=dry_run)
+
+            def launch(title: str, text: str, wait_seconds: int) -> FakeDialog:
+                dialogs.append(FakeDialog(finished=False))
+                return dialogs[-1]
+
+            self.run_loop(config, fake_run_sync, 2, launch)
+
+            self.assertEqual(len(dialogs), 1)
+
+    def test_configured_auto_approval_still_applies_after_identical_plans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = self.loop_config(Path(tmp_name))
+            config["auto_approve_destructive_loops"] = 2
+            plan = self.deletion_plan(["a", "b", "c"])
+            passes: list[str] = []
+            applied = {"done": False}
+
+            def fake_run_sync(cfg: dict[str, object], dry_run: bool = False) -> None:
+                if cfg.get("_disable_delete_propagation"):
+                    passes.append("held")
+                    return
+                if applied["done"]:
+                    passes.append("clean")
+                    return
+                sync.enforce_mutation_plan(cfg, plan, dry_run=dry_run)
+                applied["done"] = True
+                passes.append("auto")
+
+            def launch(title: str, text: str, wait_seconds: int) -> FakeDialog:
+                raise AssertionError("opt-in auto-approval must not ask")
+
+            self.run_loop(config, fake_run_sync, 3, launch)
+
+            self.assertEqual(passes, ["held", "auto", "clean"])
+            self.assertEqual(sync.read_sync_status(config)["state"], "ok")
+
+    def test_approval_is_not_applied_when_the_set_changes_before_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = self.loop_config(Path(tmp_name))
+            approved = self.deletion_plan(["a", "b", "c"])
+            grown = self.deletion_plan(["a", "b", "c", "d"])
+            # Cycles 1-2 settle and ask; cycle 3 sees the approved set once,
+            # then the set grows before the approved pass can apply it.
+            plans = [approved, approved, approved, grown]
+            passes: list[str] = []
+
+            def fake_run_sync(cfg: dict[str, object], dry_run: bool = False) -> None:
+                if cfg.get("_disable_delete_propagation"):
+                    passes.append("held")
+                    return
+                plan = plans.pop(0) if len(plans) > 1 else plans[0]
+                sync.enforce_mutation_plan(cfg, plan, dry_run=dry_run)
+                passes.append("deleted")
+
+            dialogs: list[FakeDialog] = []
+
+            def launch(title: str, text: str, wait_seconds: int) -> FakeDialog:
+                dialogs.append(FakeDialog("apply"))
+                return dialogs[-1]
+
+            self.run_loop(config, fake_run_sync, 4, launch)
+
+            self.assertNotIn("deleted", passes)
+            self.assertEqual(passes, ["held"] * 4)
+            self.assertEqual(len(dialogs), 1)
+            status = sync.read_sync_status(config)
+            self.assertEqual(status["state"], "awaiting_mutation_approval")
+            self.assertEqual(status["mutation_plan"]["destructive_count"], 4)
+
+    def test_dialog_answers_map_to_safe_decisions(self) -> None:
+        parse = sync.parse_mutation_approval_answer
+        self.assertEqual(parse(0, "apply\n", ""), "apply")
+        self.assertEqual(parse(0, "hold\n", ""), "hold")
+        self.assertEqual(parse(0, "timeout\n", ""), "timeout")
+        self.assertEqual(parse(0, "something else", ""), "hold")
+        self.assertEqual(parse(1, "", "execution error: User canceled. (-128)"), "hold")
+        self.assertEqual(parse(1, "", "execution error: No user interaction allowed. (-1713)"), "unavailable")
+
+    def test_dialog_text_travels_in_the_environment_never_in_argv_or_script(self) -> None:
+        text = 'Private title with "quotes" \\ $HOME `id` and end run'
+        with mock.patch.object(sync.sys, "platform", "darwin"), mock.patch.object(
+            sync.shutil, "which", return_value="/usr/bin/osascript"
+        ), mock.patch.object(sync.subprocess, "Popen") as popen:
+            REAL_LAUNCH_MUTATION_APPROVAL_DIALOG("대량 변경 확인", text, 30)
+
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[:2], ["osascript", "-e"])
+        self.assertTrue(argv[2].isascii())
+        self.assertIn(f'"${sync.MUTATION_APPROVAL_TEXT_ENV}"', argv[2].replace('\\"', '"'))
+        # Titles in argv would be readable by every local user through ps.
+        self.assertFalse(any("Private" in part for part in argv))
+        self.assertEqual(argv[3:], ["대량 변경 확인", "보류", "적용", "30"])
+        self.assertEqual(popen.call_args.kwargs["env"][sync.MUTATION_APPROVAL_TEXT_ENV], text)
+        self.assertEqual(popen.call_args.kwargs["stdin"], sync.subprocess.DEVNULL)
+
+        with mock.patch.object(sync.sys, "platform", "linux"), mock.patch.object(sync.subprocess, "Popen") as popen:
+            self.assertIsNone(REAL_LAUNCH_MUTATION_APPROVAL_DIALOG("t", "x", 30))
+        popen.assert_not_called()
+
+    def test_dialog_text_summarises_counts_lists_and_spread_samples(self) -> None:
+        plan = sync.build_mutation_plan(
+            [
+                *[
+                    sync.planned_mutation(
+                        "google_tasks", "delete", ["자격증", index], destructive=True,
+                        list_title="자격증", title=f"필기 {index}",
+                    )
+                    for index in range(5)
+                ],
+                *[
+                    sync.planned_mutation(
+                        "google_tasks", "delete", ["My", index], destructive=True,
+                        list_title="My", title=f"Errand {index}",
+                    )
+                    for index in range(2)
+                ],
+            ],
+            10,
+        )
+        text = sync.mutation_approval_dialog_text(sync.mutation_plan_review(plan), 21600, sample_limit=5)
+
+        self.assertIn("Google Tasks에서 삭제 (Apple에서 지워짐): 7건", text)
+        self.assertIn("자격증 5 · My 2", text)
+        self.assertIn("[My] Errand 0", text)
+        self.assertIn("외 2건", text)
+        self.assertIn("6시간 뒤 다시 묻습니다", text)
+
+    def management_config(self, base: Path) -> dict[str, object]:
+        config = self.loop_config(base)
+        config.update(
+            {
+                "_config_path": str(base / "config.json"),
+                "credentials_path": str(base / "credentials.json"),
+                "adc_credentials_path": str(base / "adc.json"),
+                "token_path": str(base / "token.json"),
+            }
+        )
+        for name in ("config.json", "credentials.json", "state.json", "status.json"):
+            (base / name).write_text("{}", encoding="utf-8")
+        return config
+
+    @staticmethod
+    def management_snapshot() -> dict[str, object]:
+        return {
+            "config_exists": True,
+            "runtime_ready": True,
+            "running_from_stable_runtime": True,
+            "helpers_ready": True,
+            "status_state": "awaiting_mutation_approval",
+            "auth_material_ready": True,
+            "agent_loaded": True,
+            "status_result": "available",
+            "launch_agent_installed": True,
+        }
+
+    def test_manager_applies_only_after_review_confirmation_and_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            base = Path(tmp_name)
+            config = self.management_config(base)
+            plan = self.deletion_plan(["Private exam plan", "Private mock test", "Private review"])
+            calls: list[object] = []
+
+            def fake_run_sync(cfg: dict[str, object], dry_run: bool = False) -> None:
+                if cfg.get("_mutation_plan_preview"):
+                    calls.append(("preview", dry_run, list((base / "backups").glob("*")) if (base / "backups").exists() else []))
+                else:
+                    calls.append(("live", str(cfg.get("_mutation_plan_destructive_approval") or "")[:64]))
+                sync.enforce_mutation_plan(cfg, plan, dry_run=dry_run)
+
+            output = io.StringIO()
+            with mock.patch.object(
+                sync, "print_management_summary", return_value=self.management_snapshot()
+            ), mock.patch.object(sync, "management_confirm", return_value=True), mock.patch.object(
+                sync, "stop_management_agent", return_value=True
+            ) as stop_agent, mock.patch.object(sync, "start_management_agent") as start_agent, mock.patch.object(
+                sync, "run_sync", side_effect=fake_run_sync
+            ), contextlib.redirect_stdout(output):
+                sync.management_approve(config, mock.Mock(yes=False))
+
+            self.assertEqual(
+                calls,
+                [("preview", True, []), ("live", plan["destructive_fingerprint"])],
+            )
+            stop_agent.assert_called_once()
+            start_agent.assert_called_once()
+            self.assertIn("Private exam plan", output.getvalue())
+            backups = list((base / "backups").iterdir())
+            self.assertEqual(len(backups), 1)
+            self.assertTrue((backups[0] / "state.json").is_file())
+            status = sync.read_sync_status(config)
+            self.assertEqual(status["state"], "ok")
+            self.assertIsNone(status["mutation_approval"])
+
+    def test_manager_hold_records_the_answer_without_any_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            base = Path(tmp_name)
+            config = self.management_config(base)
+            plan = self.deletion_plan(["a", "b", "c"])
+            live_runs: list[bool] = []
+
+            def fake_run_sync(cfg: dict[str, object], dry_run: bool = False) -> None:
+                if not cfg.get("_mutation_plan_preview"):
+                    live_runs.append(dry_run)
+                sync.enforce_mutation_plan(cfg, plan, dry_run=dry_run)
+
+            with mock.patch.object(
+                sync, "print_management_summary", return_value=self.management_snapshot()
+            ), mock.patch.object(sync, "management_confirm", return_value=False), mock.patch.object(
+                sync, "stop_management_agent", return_value=True
+            ), mock.patch.object(sync, "start_management_agent") as start_agent, mock.patch.object(
+                sync, "run_sync", side_effect=fake_run_sync
+            ), contextlib.redirect_stdout(io.StringIO()):
+                sync.management_approve(config, mock.Mock(yes=False))
+
+            self.assertEqual(live_runs, [])
+            self.assertFalse((base / "backups").exists())
+            start_agent.assert_called_once()
+            memory = sync.read_sync_status(config)["mutation_approval"]
+            self.assertEqual(memory["decision"], "hold")
+            self.assertEqual(memory["destructive_fingerprint"], plan["destructive_fingerprint"])
+
+    def test_pending_plan_has_a_next_step_in_manager_and_doctor(self) -> None:
+        condition, headline, action = sync.management_condition(self.management_snapshot())
+        self.assertEqual(condition, "mutation_approval_pending")
+        self.assertIn("계속 동기화", headline)
+        self.assertIn("대량 변경 검토 후 적용", action)
+
+        next_step = sync.doctor_next_step(
+            config_exists=True,
+            swift_ready=True,
+            helpers_ready=True,
+            runtime_ready=True,
+            auth_material_ready=True,
+            launch_agent_installed=True,
+            agent_loaded=True,
+            status_result="available",
+            status_state="awaiting_mutation_approval",
+        )
+        self.assertIn("approve", next_step)
+        self.assertEqual(
+            sync.pending_destructive_counts(
+                {
+                    "state": "awaiting_mutation_approval",
+                    "mutation_plan": {"destructive_counts": {"google_tasks.delete": 68}},
+                }
+            ),
+            {"google_tasks.delete": 68},
+        )
+        self.assertEqual(sync.pending_destructive_counts({"state": "ok", "mutation_plan": None}), {})
 
 
 if __name__ == "__main__":
