@@ -48,6 +48,7 @@ python3 -B -m py_compile \
   test_icloud_reminders_google_sync.py
 bash -n setup-new-mac.sh make-migration-bundle.sh scripts/*.sh
 bash scripts/test-release-source-gate.sh
+bash scripts/test-due-picker.sh
 ```
 
 Installation changes local credentials, runtime files, Apple Reminders access,
@@ -197,9 +198,13 @@ python3 -B -m unittest test_icloud_reminders_google_sync.py
 python3 -B -m py_compile icloud_reminders_google_sync.py test_icloud_reminders_google_sync.py
 bash -n setup-new-mac.sh make-migration-bundle.sh scripts/*.sh
 bash scripts/test-release-source-gate.sh
+bash scripts/test-due-picker.sh
 ```
 
 실제 Apple/Google 데이터를 읽거나 쓰지 않아도 위 검사를 실행할 수 있다.
+`test-due-picker.sh`의 날짜 규칙 테스트는 CI(Linux)에서도 돌고, EventKit·앱 모델
+테스트는 macOS에서만 돈다. EventKit 테스트는 저장하지 않는 메모리 속 미리 알림만
+고친다.
 
 ## 검증된 릴리스 설치
 
@@ -363,6 +368,72 @@ credential에 opaque hash로 바인딩된다. account source나 OAuth credential
 백업한 뒤, 의도한 두 계정을 확인하고 기존 state를 별도로 보존한 상태에서
 `--no-delete-stale`로 새 state를 명시적으로 재구축한다. account identifier와
 refresh token 원문은 state, status, doctor 출력에 저장하지 않는다.
+
+## 미리알림 날짜 앱
+
+Reminders 앱에서 날짜를 고르려면 항목마다 정보 패널을 열고, 날짜와 시간을 켜고,
+작은 달력과 시간 휠을 돌려야 한다. `미리알림 날짜.app`은 그 일을 한 창에서
+끝내는 네이티브 macOS 앱이다. 사용자 `응용 프로그램` 폴더(Finder → 홈 →
+응용 프로그램, Spotlight에서 "미리알림 날짜")에 설치된다.
+
+- 왼쪽은 스마트 목록(전체·오늘·지연됨·날짜 있음·날짜 없음)과 Reminders 목록,
+  가운데는 지연됨/오늘/내일/7일 이내/나중에/날짜 없음으로 묶인 미완료 미리
+  알림이다. ⌘-클릭·⇧-클릭으로 여러 개를 고를 수 있다. 검색이나 스마트 목록 때문에
+  지금 보이지 않는 항목은 선택돼 있어도 바꾸지 않는다.
+- 오른쪽 날짜 패널에서 `오늘`, `내일`, `모레`, `이번 주말`, `다음 주 월요일`,
+  `하루 당기기/미루기`, `일주일 미루기`, `날짜 없음`을 한 번에 누르거나, 달력의
+  날짜를 누르거나, `종일`·`오전 9:00`·`정오`·`오후 3:00`처럼 시간만 바꾼다.
+  날짜만 바꾸면 각자의 시간이, 시간만 바꾸면 각자의 날짜가 그대로 남는다.
+  달력의 점은 그날 마감인 미리 알림 수다.
+- `말로 입력` 칸은 `내일`, `모레 오후 3시`, `다음 주 금`, `10/15`, `15일`,
+  `3일 후`, `2시간 뒤`, `+1`(각자 하루 미루기), `종일`, `없음`을 알아듣고,
+  Enter 전에 결과 날짜를 미리 보여 준다. 아래쪽 입력줄은 같은 방식으로 날짜를
+  넣어 새 미리 알림을 만든다.
+- 단축키: ⌘1 오늘, ⌘2 내일, ⌘3 모레, ⌘4 이번 주말, ⌘5 다음 주 월요일,
+  ⌘[ / ⌘] 하루 당기기/미루기, ⇧⌘] 일주일 미루기, ⌘0 날짜 없음, ⌘L 말로 입력,
+  ⌘N 새 미리 알림, ⌘R 새로 고침, ⌘Z 마지막 날짜 변경 되돌리기(글자를 입력하는
+  중에는 입력 되돌리기). 목록에서 오른쪽 클릭해도 같은 날짜 메뉴가 나온다.
+
+바꾸는 것은 마감 날짜뿐이다. 제목, 메모, 목록, 우선순위, 반복 규칙은 건드리지
+않는다. Reminders가 "마감 시각에 알림"을 마감 시각과 같은 시각 알림으로 저장하기
+때문에, 그 알림은 날짜와 함께 옮기고 시간을 없애면(종일) 지운다. 종일 항목에
+시간을 정하면 Reminders 앱처럼 그 시각 알림을 만든다. 그 밖의 알림(몇 분 전,
+위치, 다른 시각)은 그대로 둔다. 마감일을 따라가던 시작일은 함께 옮기고, 새
+마감보다 늦어지는 시작일은 마감으로 당긴다. 반복 미리 알림은 날짜를 없앨 수 없고
+읽기 전용 목록은 건너뛴다. 목록을 불러온 뒤 다른 기기나 동기화가 먼저 바꾼 항목은
+덮어쓰지 않고 그대로 둔다. 모든 변경은 한 번에 저장되고 `되돌리기`로 원래 날짜,
+시작일, 알림까지 돌린다. 앱은 네트워크를 쓰지 않으며, 바뀐 날짜는 기존 LaunchAgent가
+평소처럼 Google Tasks에 날짜로 반영한다(Google Tasks는 시간을 저장하지 않는다).
+
+검토·병합된 main에서 설치한다. 설치기는 `setup-new-mac.sh`와 같은 릴리스 소스
+게이트를 먼저 통과해야 하고, 실행 중인 앱을 닫은 뒤 한 번에 교체한다.
+
+```bash
+cd ~/apps/icloud-reminders-google-sync
+git switch main
+git pull --ff-only
+DEPLOY_EXPECTED_COMMIT="$(git rev-parse HEAD)" bash scripts/install-due-picker-app.sh --reveal
+```
+
+처음 열 때 한 번 미리 알림 접근을 허용한다. 거부했다면 시스템 설정 → 개인정보
+보호 및 보안 → 미리 알림에서 `미리알림 날짜`를 켜고 앱의 `다시 확인`을 누른다.
+Xcode 없이 Command Line Tools만으로 빌드되고, `Apple Development` 인증서가 있으면
+그것으로 서명해 재설치 후에도 권한이 유지된다(없으면 ad-hoc 서명이라 다시
+묻는다). 소스 구조와 개발용 명령:
+
+```text
+due-picker/Sources/DueCore.swift       # 날짜 규칙, 한국어 입력 해석, 알림·시작일 계획 (Foundation만)
+due-picker/Sources/ReminderStore.swift # EventKit 읽기·저장·되돌리기
+due-picker/Sources/AppModel.swift      # 선택, 필터, 적용, 빠른 추가
+due-picker/Sources/Views.swift         # SwiftUI 창
+due-picker/Tools/                      # 아이콘, 데모 데이터, 화면 스냅숏
+```
+
+```bash
+bash scripts/test-due-picker.sh
+bash scripts/build-due-picker-app.sh                      # due-picker/build/ (Git 무시)
+bash scripts/build-due-picker-app.sh --snapshots /tmp/due # 데모 데이터로 창 PNG 렌더링
+```
 
 ## 수동 동기화
 
