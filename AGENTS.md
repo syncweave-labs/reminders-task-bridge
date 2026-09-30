@@ -19,12 +19,6 @@ user's Mac and are never proved by source CI alone.
 - Only fix sync behavior backed by a reproducible case and a regression test.
 - Google credentials, refresh tokens, sync state, logs, and exported task or
   reminder data stay outside the repository.
-- `미리알림 날짜.app` changes only a reminder's due date, the start date that
-  mirrored it, and the clock alarms anchored to the due time. It never edits
-  titles, notes, lists, priority, or recurrence, never removes a recurring
-  reminder's date, skips read-only lists, changes only selected reminders the
-  list is currently showing, leaves a reminder alone when it changed after the
-  list was loaded, and makes no network requests.
 
 ## Source And Runtime Ownership
 
@@ -35,10 +29,6 @@ user's Mac and are never proved by source CI alone.
 - Config, credentials, state, and status:
   `~/.config/icloud-reminders-google-sync/`.
 - LaunchAgent: `~/Library/LaunchAgents/com.icloud-reminders-google-sync.plist`.
-- Date picker app: `~/Applications/미리알림 날짜.app` (bundle id
-  `com.icloud-reminders-google-sync.due-picker`), installed only by
-  `scripts/install-due-picker-app.sh`; the reviewed commit is recorded in the
-  bundle's `Contents/Resources/release-source.txt`.
 - Logs: `~/Library/Logs/icloud-reminders-google-sync/sync.out.log` and
   `~/Library/Logs/icloud-reminders-google-sync/sync.err.log`, in a `0700`
   directory. Reminder and task titles appear in them, so they never go back to
@@ -82,11 +72,6 @@ Do not run setup, load/restart the LaunchAgent, authenticate Google, or execute
 a live sync unless the user requested that live operation. Source-only work may
 test that the entrypoint fails closed before mutation.
 
-`scripts/install-due-picker-app.sh` runs the same gate before it builds, then
-replaces `~/Applications/미리알림 날짜.app` in one rename, closing a running copy
-first. It does not touch the runtime release, config, or LaunchAgent. Install
-it only from reviewed main, and only when the user asked for the app.
-
 ## Structure
 
 - `icloud_reminders_google_sync.py`: sync engine and CLI.
@@ -102,17 +87,8 @@ it only from reviewed main, and only when the user asked for the app.
 - `scripts/check-release-source.sh`: fail-closed release source gate.
 - `scripts/test-release-source-gate.sh`: isolated gate self-test.
 - `test_icloud_reminders_google_sync.py`: local regression tests.
-- `due-picker/`: the `미리알림 날짜` macOS app (SwiftUI + EventKit, built with
-  the Command Line Tools only). `Sources/DueCore.swift` holds the pure date
-  rules, Korean input parser, and alarm/start-date plans; `ReminderStore.swift`
-  the EventKit reads and guarded writes; `Tools/` the icon, demo data, and
-  offscreen snapshot renderer. SwiftUI's `@State` is a macro whose plugin ships
-  only with Xcode, so view-local state lives in `ObservableObject`s.
-- `scripts/build-due-picker-app.sh`: builds and signs the app bundle
-  (`--snapshots DIR` renders the window with demo data instead).
-- `scripts/install-due-picker-app.sh`: gated installer into `~/Applications`.
-- `scripts/test-due-picker.sh`: date-rule tests (Linux and macOS) plus EventKit
-  and app-model tests on unsaved in-memory reminders (macOS only).
+- The `미리알림 날짜` date picker app is not part of this repository; it lives
+  in `syncweave-labs/reminders-due-picker`.
 
 ## Required Source Checks
 
@@ -123,13 +99,7 @@ python3 -B -m unittest test_icloud_reminders_google_sync.py
 python3 -B -m py_compile icloud_reminders_google_sync.py test_icloud_reminders_google_sync.py
 bash -n setup-new-mac.sh make-migration-bundle.sh scripts/*.sh
 bash scripts/test-release-source-gate.sh
-bash scripts/test-due-picker.sh
 ```
-
-For a change to the app's views, also run
-`bash scripts/build-due-picker-app.sh` and render
-`bash scripts/build-due-picker-app.sh --snapshots <dir>`; the snapshots use
-demo data only. Never test the app's write path against real reminders.
 
 Read-only runtime diagnosis is allowed when relevant:
 
