@@ -26,3 +26,4 @@ jobs:
       - run: python3 -B -m py_compile icloud_reminders_google_sync.py test_icloud_reminders_google_sync.py
       - run: bash -n setup-new-mac.sh make-migration-bundle.sh scripts/*.sh
       - run: bash scripts/test-release-source-gate.sh
+      - run: bash scripts/test-due-picker.sh
