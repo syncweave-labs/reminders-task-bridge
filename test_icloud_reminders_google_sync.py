@@ -1762,6 +1762,20 @@ class ListPolicyTests(unittest.TestCase):
 
         self.assertEqual(plan["conflicts"], ["Google Manual"])
         self.assertEqual([action["operation"] for action in plan["actions"]], ["update"])
+        # The structured record the app's review journal consumes, alongside the title list.
+        self.assertEqual([(r["list_title"], r["task"]["title"]) for r in plan["conflict_records"]], [("Manual", "Google Manual")])
+
+    def test_conflict_review_is_a_no_op_without_the_app_journal(self) -> None:
+        # The engine is shared with the due-picker app; this checkout has no
+        # sync_ui_support, so recording must neither write status nor warn.
+        with tempfile.TemporaryDirectory() as tmp_name:
+            config = sync.default_config()
+            config["status_path"] = str(Path(tmp_name) / "status.json")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                sync.record_conflicts_for_review(config, {}, [{"list_title": "L", "uid": "u", "task": {}, "reminder": {}}])
+            self.assertEqual(list(Path(tmp_name).iterdir()), [])
+            self.assertEqual(stderr.getvalue(), "")
 
     def test_actual_sync_writes_only_apple_to_google_lists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
