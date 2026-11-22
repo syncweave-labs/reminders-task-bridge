@@ -2561,6 +2561,23 @@ def plan_google_task_changes_to_reminders(
     source_controlled: set[tuple[str, str]] = set()
     actions: list[dict[str, Any]] = []
     seen_deleted_uids: set[tuple[str, str]] = set()
+    conflict_records: list[dict[str, Any]] = []
+
+    def record_conflict(title: str, conflict_list_title: str, conflict_uid: str,
+                        conflict_task: dict[str, Any], conflict_reminder: dict[str, Any]) -> None:
+        # Additive: keep the printed title list unchanged for existing callers
+        # and also collect the structured record U09 persists for review. The
+        # sync caller stamps the account binding and builds the opaque id, so
+        # this layer stays free of account material.
+        conflicts.append(title)
+        conflict_records.append(
+            {
+                "list_title": conflict_list_title,
+                "uid": conflict_uid,
+                "task": conflict_task,
+                "reminder": conflict_reminder,
+            }
+        )
 
     if allow_deletes:
         for list_title, tasks in deleted_tasks_by_list.items():
@@ -2607,7 +2624,7 @@ def plan_google_task_changes_to_reminders(
                                 continue
                         else:
                             title = str(task.get("title") or reminder.get("title") or record.get("title") or uid)
-                            conflicts.append(title)
+                            record_conflict(title, list_title, uid, task, reminder)
                             blocked.add((list_title, uid))
                             continue
 
@@ -2701,7 +2718,7 @@ def plan_google_task_changes_to_reminders(
             )
             if reopened_without_state and not google_is_authoritative:
                 if policy["conflict_policy"] != "newer_wins":
-                    conflicts.append(title)
+                    record_conflict(title, list_title, uid, existing, reminder)
                     blocked.add((list_title, uid))
                     continue
                 if not google_task_is_newer_than_reminder(existing, reminder):
@@ -2740,7 +2757,7 @@ def plan_google_task_changes_to_reminders(
                             )
                         )
                     continue
-                conflicts.append(title)
+                record_conflict(title, list_title, uid, existing, reminder)
                 blocked.add((list_title, uid))
                 continue
 
@@ -2833,6 +2850,7 @@ def plan_google_task_changes_to_reminders(
         "google_patches": google_patches,
         "initialized": initialized,
         "conflicts": conflicts,
+        "conflict_records": conflict_records,
         "blocked": blocked,
         "source_controlled": source_controlled,
         "actions": actions,
@@ -4505,6 +4523,7 @@ def run_tasks_sync(config: dict[str, Any], dry_run: bool = False) -> None:
         state,
         allow_deletes=allow_deletes,
     )
+    record_conflicts_for_review(config, account_binding, bidirectional_plan.get("conflict_records") or [])
     preflight_blocked = set(bidirectional_plan["blocked"]) | set(bidirectional_plan["source_controlled"])
     planned_actions = [
         planned_mutation("google_tasks", "create_list", list_title)
@@ -4986,6 +5005,43 @@ def run_sync(config: dict[str, Any], dry_run: bool = False) -> None:
 
 def utc_now_text() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def record_conflicts_for_review(
+    config: dict[str, Any],
+    account_binding: dict[str, Any],
+    raw_records: list[dict[str, Any]],
+) -> None:
+    """Persist structured conflicts for review and keep only counts in status.
+
+    Additive and failure-isolated: a journal write problem must never break the
+    sync that just ran, so any error here is swallowed after a warning. The
+    status file receives only ``conflict_summary`` -- counts and which fields
+    differ -- never a title, note, date, or account value.
+    """
+    try:
+        import sync_ui_support as ui
+    except ImportError:
+        return  # standalone install: the review journal belongs to the app
+    try:
+        directory = expand_path(config["status_path"]).parent / "Conflicts"
+        journal = ui.ConflictJournal(directory)
+        observed: set[str] = set()
+        for raw in raw_records:
+            record = ui.build_conflict_record(
+                account_binding,
+                str(raw.get("list_title") or ""),
+                str(raw.get("uid") or ""),
+                raw.get("reminder") or {},
+                raw.get("task") or {},
+            )
+            journal.observe(record)
+            observed.add(record["conflict_id"])
+        journal.reconcile(observed)
+        summary = ui.conflict_status_summary(journal.records())
+        write_sync_status(config, {"conflict_summary": summary})
+    except Exception as exc:  # pragma: no cover - defensive, never fatal
+        eprint(f"Could not record conflicts for review: {exc}")
 
 
 def write_sync_status(config: dict[str, Any], updates: dict[str, Any]) -> None:
