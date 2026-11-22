@@ -18,6 +18,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 import urllib.error
@@ -235,12 +236,20 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False)
-        handle.write("\n")
-    os.chmod(tmp_path, 0o600)
-    tmp_path.replace(path)
+    # A per-call temp file: the loop, the manager and the app write status.json
+    # and token.json concurrently, and a shared ".tmp" name interleaves them.
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+        raise
 
 
 @contextlib.contextmanager
@@ -2310,7 +2319,14 @@ def google_task_to_reminder_operation(
         "title": material["title"],
         "notes": material["notes"],
     }
-    if material["due_date"]:
+    timed_due = None if reminder.get("due_date") else parse_optional_rfc3339(reminder.get("due_at"))
+    if material["due_date"] and timed_due:
+        # Google Tasks stores only the date; keep the Apple reminder's time of day.
+        local_time = timed_due.astimezone().time()
+        moved = dt.datetime.combine(dt.date.fromisoformat(material["due_date"]), local_time).astimezone()
+        operation["all_day"] = False
+        operation["due_at"] = format_rfc3339(moved)
+    elif material["due_date"]:
         operation["all_day"] = True
         operation["due_date"] = material["due_date"]
     else:
