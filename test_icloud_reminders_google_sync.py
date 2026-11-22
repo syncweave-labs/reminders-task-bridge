@@ -1063,6 +1063,54 @@ class GoogleTasksDueTests(unittest.TestCase):
         write_status.assert_not_called()
 
 
+    def test_google_title_change_keeps_apple_time_of_day(self) -> None:
+        reminder = {
+            "stable_id": "timed-1",
+            "title": "Meeting",
+            "due_date": None,
+            "due_at": "2026-05-08T06:30:00Z",
+        }
+        local = sync.parse_rfc3339(reminder["due_at"]).astimezone()
+        task = {"title": "Meeting prep", "due": f"{local.date().isoformat()}T00:00:00.000Z", "status": "needsAction"}
+
+        operation = sync.google_task_to_reminder_operation(task, reminder, sync.default_config())
+
+        self.assertIs(operation["all_day"], False)
+        self.assertEqual(operation["due_at"], "2026-05-08T06:30:00Z")
+        self.assertNotIn("due_date", operation)
+
+    def test_google_date_move_keeps_apple_time_of_day(self) -> None:
+        reminder = {"stable_id": "timed-2", "title": "Call", "due_date": None, "due_at": "2026-05-08T06:30:00Z"}
+        local = sync.parse_rfc3339(reminder["due_at"]).astimezone()
+        new_date = local.date() + dt.timedelta(days=2)
+        task = {"title": "Call", "due": f"{new_date.isoformat()}T00:00:00.000Z"}
+
+        operation = sync.google_task_to_reminder_operation(task, reminder, sync.default_config())
+
+        moved = sync.parse_rfc3339(operation["due_at"]).astimezone()
+        self.assertEqual(moved.date(), new_date)
+        self.assertEqual(moved.time(), local.time())
+
+    def test_concurrent_json_writers_never_interleave(self) -> None:
+        real_dump = json.dump
+        nested = {"done": False}
+
+        def dump_with_concurrent_writer(payload, handle, **kwargs):
+            if not nested["done"]:
+                nested["done"] = True
+                sync.write_json_atomic(path, {"writer": "other", "pad": "y" * 4000})
+            return real_dump(payload, handle, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp_name:
+            path = Path(tmp_name) / "status.json"
+            with mock.patch.object(sync.json, "dump", side_effect=dump_with_concurrent_writer):
+                sync.write_json_atomic(path, {"writer": "first", "pad": "x" * 10})
+
+            self.assertEqual(sync.read_json(path)["writer"], "first")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(sorted(p.name for p in Path(tmp_name).iterdir()), ["status.json"])
+
+
 class ListPolicyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.account_binding_patch = mock.patch.object(
