@@ -243,6 +243,33 @@ class AccountBindingIsolationTests(unittest.TestCase):
                 client.access_token()
 
 
+class GoogleRetryTests(unittest.TestCase):
+    def test_google_clients_retry_only_safe_requests_with_a_short_wait(self) -> None:
+        for client_type, method, limit, delay in [
+            (sync.GoogleTasksClient, "GET", 3, "2"),
+            (sync.GoogleCalendarClient, "PUT", 3, "Thu, 01 Jan 1970 00:00:02 GMT"),
+            (sync.GoogleTasksClient, "PATCH", 3, "2"),
+            (sync.GoogleTasksClient, "POST", 1, "2"),
+            (sync.GoogleCalendarClient, "GET", 1, "60"),
+        ]:
+            with self.subTest(client=client_type, method=method, delay=delay):
+                client = client_type.__new__(client_type)
+                client.access_token = lambda: "fake"
+                failures = [
+                    sync.urllib.error.HTTPError("https://example.invalid", code, "busy",
+                                               {"Retry-After": delay}, io.BytesIO(b"busy"))
+                    for code in (429, 503, 503)
+                ]
+                with (mock.patch.object(sync.urllib.request, "urlopen", side_effect=failures) as send,
+                      mock.patch.object(sync.time, "time", return_value=0),
+                      mock.patch.object(sync.time, "sleep") as sleep):
+                    with self.assertRaises(sync.GoogleApiError) as caught:
+                        client.request(method, "/resource")
+                    self.assertEqual(send.call_count, limit)
+                    self.assertEqual(caught.exception.status, 503 if limit == 3 else 429)
+                    self.assertEqual(sleep.call_args_list, [mock.call(2)] * (limit - 1))
+
+
 class GoogleTasksDueTests(unittest.TestCase):
     def test_reminders_apply_uses_stable_list_id_without_unsafe_title_fallback(self) -> None:
         source = (Path(__file__).resolve().parent / "RemindersApply.swift").read_text(encoding="utf-8")

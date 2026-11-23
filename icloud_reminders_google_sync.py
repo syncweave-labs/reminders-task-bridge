@@ -5,6 +5,7 @@ import argparse
 import base64
 import contextlib
 import datetime as dt
+from email.utils import parsedate_to_datetime
 import fcntl
 import hashlib
 import http.server
@@ -1133,6 +1134,30 @@ def refresh_token_with_fallback(config: dict[str, Any], token: dict[str, Any]) -
         raise AuthenticationRequired(google_reauth_message(config)) from exc
 
 
+def google_api_json(request: urllib.request.Request) -> dict[str, Any]:
+    attempts = 3 if request.get_method() in {"GET", "PUT", "PATCH"} else 1
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            if attempt + 1 == attempts or not (exc.code == 429 or 500 <= exc.code <= 599):
+                raise
+            delay = 2 ** attempt
+            retry_after = (exc.headers.get("Retry-After", "") if exc.headers else "").strip()
+            if retry_after:
+                try:
+                    delay = (float(retry_after) if retry_after.isascii() and retry_after.isdecimal()
+                             else parsedate_to_datetime(retry_after).timestamp() - time.time())
+                except (TypeError, ValueError, OverflowError, OSError):
+                    pass
+            if delay > 5:
+                raise
+            exc.close()
+            time.sleep(max(0, delay))
+
+
 class GoogleCalendarClient:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
@@ -1165,11 +1190,10 @@ class GoogleCalendarClient:
 
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                raw = response.read().decode("utf-8")
-                return json.loads(raw) if raw else {}
+            return google_api_json(request)
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
+            with exc:
+                raw = exc.read().decode("utf-8", errors="replace")
             if exc.code == 401 and retry:
                 self.token = refresh_token_with_fallback(self.config, self.token)
                 return self.request(method, path, params=params, body=body, retry=False)
@@ -1246,11 +1270,10 @@ class GoogleTasksClient:
 
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                raw = response.read().decode("utf-8")
-                return json.loads(raw) if raw else {}
+            return google_api_json(request)
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
+            with exc:
+                raw = exc.read().decode("utf-8", errors="replace")
             if exc.code == 401 and retry:
                 self.token = refresh_token_with_fallback(self.config, self.token)
                 return self.request(method, path, params=params, body=body, retry=False)
