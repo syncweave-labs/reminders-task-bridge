@@ -4610,6 +4610,9 @@ def run_tasks_sync(config: dict[str, Any], dry_run: bool = False) -> None:
         allow_deletes=allow_deletes,
     )
     if google_applied and not dry_run:
+        if allow_deletes:
+            print("Deferring outbound deletions and completions until the next reviewed snapshot.")
+            allow_deletes = False
         time.sleep(1)
         reminders, desired_by_list, skipped_invalid = build_desired_tasks(config)
         print(f"Apple Reminders re-exported after Google Tasks changes: {len(reminders)}")
@@ -4942,6 +4945,9 @@ def run_calendar_sync(config: dict[str, Any], dry_run: bool = False) -> None:
         planned=bidirectional_plan,
     )
     if google_applied and not dry_run:
+        if allow_deletes:
+            print("Deferring outbound deletions and completions until the next reviewed snapshot.")
+            allow_deletes = False
         time.sleep(1)
         reminders, desired, skipped_invalid = build_desired_events(config)
         print(f"Apple Reminders re-exported after Google changes: {len(reminders)}")
@@ -4989,7 +4995,7 @@ def run_calendar_sync(config: dict[str, Any], dry_run: bool = False) -> None:
     if skip_stale_delete:
         print("Skipping stale deletion because the Reminders source exported 0 items.")
 
-    if config["delete_stale"] and not skip_stale_delete:
+    if allow_deletes:
         stale: dict[str, str] = {}
         for key, record in list(state["events"].items()):
             if not isinstance(record, dict) or record.get("calendar_id") != calendar_id:
