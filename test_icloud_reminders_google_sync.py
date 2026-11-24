@@ -2388,6 +2388,43 @@ class MutationPlanTests(unittest.TestCase):
             self.assertNotIn("Private calendar reminder", visible)
             self.assertNotIn("Sensitive calendar title", visible)
 
+    def test_empty_reexport_cannot_delete_google_items_after_an_inbound_edit(self):
+        for mode in ("tasks", "calendar"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp_name:
+                config = self.config(Path(tmp_name))
+                config.update(bidirectional=True, delete_stale=True, allow_empty_source_delete=False)
+                tasks = mode == "tasks"
+                reminders, desired, cloud = [], {}, []
+                for i in range(4):
+                    reminder = {
+                        "stable_id": f"reminder-{i}", "title": f"Local {i}", "notes": "",
+                        "list_title": "Personal", "list_id": "list-local", "account_id": "icloud",
+                        "due_date": "2026-07-12", "due_at": None, "all_day": True,
+                        "modified_at": "2026-07-11T00:00:00Z", "completed_at": None,
+                        "is_completed": False,
+                    }
+                    uid, body, digest = (sync.build_task if tasks else sync.build_event)(reminder, config)
+                    reminders.append(reminder)
+                    desired[uid] = (body, digest, reminder)
+                    cloud.append({**body, "id": f"cloud-{i}"})
+                cloud[0]["title" if tasks else "summary"] = "Google edit"
+                client = mock.Mock()
+                client.list_tasklists.return_value = [{"id": "list-1", "title": "Personal"}]
+                client.list_tasks.return_value = cloud
+                client.list_synced_events.return_value = cloud
+                with (
+                    mock.patch.object(sync, "GoogleTasksClient" if tasks else "GoogleCalendarClient", return_value=client),
+                    mock.patch.object(sync, "build_desired_tasks" if tasks else "build_desired_events",
+                                      side_effect=[(reminders, {"Personal": desired} if tasks else desired, 0), ([], {}, 0)]),
+                    mock.patch.object(sync, "run_reminders_apply", return_value=[{"status": "updated"}]) as apply,
+                    mock.patch.object(sync.time, "sleep"),
+                ):
+                    (sync.run_tasks_sync if tasks else sync.run_calendar_sync)(config)
+                apply.assert_called_once()
+                client.delete_task.assert_not_called()
+                client.delete_event.assert_not_called()
+                client.patch_task.assert_not_called()
+
     def test_no_delete_stale_excludes_two_way_deletes_and_dedupe(self) -> None:
         config = sync.default_config()
         config["bidirectional"] = True
